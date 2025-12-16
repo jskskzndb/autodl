@@ -1,0 +1,27 @@
+V0：“解耦下采样”版 (激进魔改)
+特征：强行修改 ResNet 内部结构，试图通过显式 MaxPool 控制下采样。这是导致你之前训练精度下降、预训练权重失效的那个版本。
+编码器 (Encoder)：
+Stride 修改：代码中包含 self.layer2[0].conv2.stride = (1, 1)。它强行把 ResNet 的步长改为 1。
+显式下采样：引入了 self.explicit_down_to_layer2 (MaxPool)，试图在 WGN 之后手动进行下采样。
+WGN 位置：
+串联在主干中：WGN 直接处理主干特征，处理完后再下采样传给下一层。
+问题：这种改法破坏了 ImageNet 预训练权重的特征分布（因为预训练模型是在 Stride=2 下训练的），导致模型很难训练。
+
+V1:“浅层截断 + 输入分支”版 (早期尝试)
+特征：这是一个比较早期的非标准 U-Net 设计，它舍弃了 ResNet 最深层，并增加了一个处理原图的独立分支。
+编码器 (Encoder)：
+截断 (Truncated)：代码注释写着 提取ResNet50各层（舍弃layer4）。它只用到了 Layer 3，这意味着最大下采样倍率只有 1/16。
+输入分支：定义了 self.input_branch，直接对原始图像进行卷积，用于最后的跳跃连接。
+WGN 位置：
+串联在主干中：x3, x3_high = self.wgn_enhance1(x3)，WGN 修改了主干特征流。
+V2:  标准 ResUNet + 侧路增强”版 (最终推荐)
+特征：这是最成熟、最科学的版本。它保持了 ResNet 的原汁原味，将创新点移到了侧路（跳跃连接），是目前效果最好、最容易发论文的结构。
+编码器 (Encoder)：
+标准结构：保留了 layer1 到 layer4 的完整结构，且完全没有修改 Stride。这意味着预训练权重可以 100% 发挥作用。
+深度：下采样达到 1/32 (Layer 4)，语义信息最丰富。
+WGN 位置：
+跳跃连接增强 (Skip Enhancement)：WGN 不再干扰主干，而是挂载在跳跃连接上（self.wgn_skip1, self.wgn_skip2...）。
+逻辑：skip3, x3_high = self.wgn_skip3(x3)。主干特征 x3 继续往下走，WGN 处理后的 skip3 横向传给解码器。
+解码器 (Decoder)：
+升级为 5 级上采样，完美适配 ResNet 的 5 级特征。
+V3:同V2,WGN 位置变体：将 WGN 串联在编码器主干中 (Serial Encoder Enhancement)

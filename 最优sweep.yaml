@@ -1,0 +1,51 @@
+command:
+- ${env}
+- ${interpreter}
+- ${program}
+- --epochs
+- "70"
+- --classes
+- "1"
+- --bilinear
+- --scale
+- "0.5"
+- --use-cafm
+method: bayes
+metric:
+  goal: maximize
+  name: val/f1_best
+parameters:
+  batch_size:
+    values:
+    - 2
+    - 4
+    - 8
+    - 16
+  focal_alpha:
+    distribution: uniform
+    max: 0.9
+    min: 0.5
+  focal_gamma:
+    values:
+    - 1.5
+    - 2
+    - 2.5
+    - 3
+  gradient_clipping:
+    values:
+    - 0.5
+    - 1
+    - 1.5
+  learning_rate:
+    distribution: log_uniform_values
+    max: 0.001
+    min: 1e-06
+  momentum:
+    distribution: uniform
+    max: 0.999
+    min: 0.9
+  weight_decay:
+    distribution: log_uniform_values
+    max: 1e-07
+    min: 1e-09
+program: train.py

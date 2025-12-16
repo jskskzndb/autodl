@@ -1,0 +1,4 @@
+# ninja log v5
+0	4322	1765719075678050009	/root/autodl-tmp/UNet卷积改进版2_服务器/ops_dcnv3/build/temp.linux-x86_64-cpython-310/root/autodl-tmp/UNet卷积改进版2_服务器/ops_dcnv3/src/cpu/dcnv3_cpu.o	e16808588039b586
+1	16006	1765719087365819936	/root/autodl-tmp/UNet卷积改进版2_服务器/ops_dcnv3/build/temp.linux-x86_64-cpython-310/root/autodl-tmp/UNet卷积改进版2_服务器/ops_dcnv3/src/vision.o	1b2ae7530d4f4f52
+1	43792	1765719115141275930	/root/autodl-tmp/UNet卷积改进版2_服务器/ops_dcnv3/build/temp.linux-x86_64-cpython-310/root/autodl-tmp/UNet卷积改进版2_服务器/ops_dcnv3/src/cuda/dcnv3_cuda.o	65623f659a7dd4af
