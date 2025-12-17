@@ -107,6 +107,7 @@ def get_args():
     parser.add_argument('--use-dubm', action='store_true', default=False, help='Enable D-UBM (SOTA)')
     parser.add_argument('--use-strg', action='store_true', default=False)
     parser.add_argument('--use-dual-stream', action='store_true', default=False) # 🔥 修复报错的关键
+    parser.add_argument('--use-dsis', action='store_true', default=False, help='Enable Dual-Stream Interactive Skip Module')
     # WGN 参数
     parser.add_argument('--wgn-base-order', type=int, default=3)
     parser.add_argument('--wgn-orders', type=str, default=None)
@@ -150,6 +151,7 @@ if __name__ == '__main__':
         wgn_orders=wgn_orders,
         # 🔥🔥🔥 [关键修改 2] 传入参数 🔥🔥🔥
         use_dcn_in_phd=args.use_dcn,
+        use_dsis=args.use_dsis,
         use_dubm=args.use_dubm,
         use_dual_stream=args.use_dual_stream # 🔥 传入双流开关 
     )
