@@ -438,6 +438,7 @@ def get_args():
     parser.add_argument('--use-strg', action='store_true', default=False, help='Enable STRG Skip Enhancement')
     parser.add_argument('--use-dual-stream', action='store_true', default=False, help='Enable Dual-Stream Boundary Architecture')
     
+    parser.add_argument('--use-dsis', action='store_true', default=False, help='Enable Dual-Stream Interactive Skip Module')
     # 其他增强模块 (保持原有开关定义，但移除了旧版 Edge Logic 的执行)
     parser.add_argument('--use-wgn-enhancement', action='store_true', default=False)
     parser.add_argument('--use-cafm', action='store_true', default=False)
@@ -492,7 +493,8 @@ if __name__ == '__main__':
         use_dcn_in_phd=args.use_dcn,
         use_dubm=args.use_dubm,
         use_strg=args.use_strg,
-        use_dual_stream=args.use_dual_stream # 🔥 新增双流
+        use_dual_stream=args.use_dual_stream, # 🔥 新增双流
+        use_dsis=args.use_dsis # 🔥 传入参数
     )
     
     model = model.to(memory_format=torch.channels_last)

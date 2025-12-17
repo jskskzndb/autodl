@@ -1,8 +1,9 @@
 """
-unet_model_unified.py (Channel Fix Version)
-修复：
-1. 修正了 self.outc 的输入通道数错误 (从 32 改为 64)，解决了 RuntimeError。
-2. 保持了之前所有的双流架构、STRG、WGN 等逻辑。
+unet_model_unified.py (DSIS Skip-Channel Fix)
+修复说明：
+1. 修正了 up2 和 up3 初始化时的 skip_channels 参数，使其使用经过 DSIS 判断后的 skip_c2/skip_c1，
+   而不是原始的 c2/c1。解决了 'expected 512 channels, but got 320' 的报错。
+2. 完整保留了双流、STRG、CAFM 等逻辑。
 """
 
 from .unet_parts import *
@@ -31,7 +32,7 @@ except ImportError: STRG_Block = None
 try: from .boundary_stream import BoundaryStream
 except ImportError: BoundaryStream = None
 
-# WGN (Wavelet Group Norm) - 🔥 保留用于 Encoder 增强
+# WGN (Wavelet Group Norm)
 try: from .wgn_module import WGN
 except ImportError: WGN = None
 
@@ -39,6 +40,9 @@ except ImportError: WGN = None
 try: from .cafm_module import CAFM
 except ImportError: CAFM = None
 
+# DSIS (Dual-Stream Interactive Skip)
+try: from .dsis_module import DSIS_Module
+except ImportError: DSIS_Module = None
 
 # ================================================================
 # 2. 适配器：Up_PHD
@@ -66,6 +70,7 @@ class Up_PHD(nn.Module):
         x1 = self.up(x1)
         
         if x2 is not None:
+            # Padding 对齐
             diffY = x2.size()[2] - x1.size()[2]
             diffX = x2.size()[3] - x1.size()[3]
             if diffX != 0 or diffY != 0:
@@ -88,7 +93,7 @@ class UNet(nn.Module):
     def __init__(self, n_channels, n_classes, bilinear=True, 
                  encoder_name='resnet', decoder_name='phd', cnext_type='convnextv2_tiny', 
                  use_wgn_enhancement=False, use_cafm=False, use_edge_loss=False, wgn_orders=None,
-                 use_dcn_in_phd=False, use_dubm=False, use_strg=False,
+                 use_dcn_in_phd=False, use_dsis=False, use_dubm=False, use_strg=False,
                  use_dual_stream=False):
         
         super(UNet, self).__init__()
@@ -98,6 +103,8 @@ class UNet(nn.Module):
         self.encoder_name = encoder_name
         self.decoder_name = decoder_name
         
+        # 初始化各个模块的开关
+        self.use_dsis = use_dsis and (DSIS_Module is not None)
         self.use_cafm = use_cafm and (CAFM is not None)
         self.use_dual_stream = use_dual_stream and (BoundaryStream is not None)
 
@@ -131,11 +138,10 @@ class UNet(nn.Module):
         c1, c2, c3, c4 = self.channels
 
         # --------------------------------------------------------
-        # B. WGN 初始化 (Encoder 增强保留)
+        # B. WGN 初始化
         # --------------------------------------------------------
         if use_wgn_enhancement and wgn_orders is not None and WGN is not None:
             print("   ✨ Applying WGN Enhancement (Encoder)...")
-            
             def replace_bn_with_wgn(module, order):
                 for name, child in module.named_children():
                     if isinstance(child, (nn.BatchNorm2d, nn.GroupNorm)):
@@ -143,7 +149,6 @@ class UNet(nn.Module):
                         setattr(module, name, WGN(num_features, order=order))
                     else:
                         replace_bn_with_wgn(child, order)
-
             if encoder_name == 'resnet':
                 replace_bn_with_wgn(self.layer1, wgn_orders['layer1'][0])
                 replace_bn_with_wgn(self.layer2, wgn_orders['layer2'][0])
@@ -158,37 +163,56 @@ class UNet(nn.Module):
             self.cafm2 = CAFM(c2)
             self.cafm3 = CAFM(c3)
             self.cafm4 = CAFM(c4)
+        
+        # --------------------------------------------------------
+        # D. DSIS 初始化 (设置 skip_c1 和 skip_c2)
+        # --------------------------------------------------------
+        if self.use_dsis:
+            print("   🔗 Applying DSIS (Dual-Stream Interactive Skip)...")
+            dsis_channels = 64 # DSIS 输出固定为 64 通道
+            self.dsis_module = DSIS_Module(c1_in=c1, c2_in=c2, c_base=dsis_channels)
+            
+            # 🔥 这里的计算逻辑是正确的
+            skip_c1 = dsis_channels
+            skip_c2 = dsis_channels
+        else:
+            skip_c1 = c1
+            skip_c2 = c2
 
         # --------------------------------------------------------
-        # D. 双流架构：边界流初始化
+        # E. 双流架构：边界流初始化
         # --------------------------------------------------------
         if self.use_dual_stream:
             print("   🌊 [Dual-Stream] Initializing Boundary Stream (Explicit Edge)...")
             self.boundary_stream = BoundaryStream(in_channels=c1)
 
         # --------------------------------------------------------
-        # E. Decoder 初始化
+        # F. Decoder 初始化
         # --------------------------------------------------------
         UpBlock = Up_PHD if decoder_name == 'phd' else Up
         
         if decoder_name == 'phd':
+            # Up1 接收 s3 (c3)，DSIS 不处理 c3，所以 skip 仍为 c3
             self.up1 = UpBlock(c4, c3, bilinear, skip_channels=c3, use_dcn=use_dcn_in_phd, use_dubm=use_dubm, use_strg=use_strg)
-            self.up2 = UpBlock(c3, c2, bilinear, skip_channels=c2, use_dcn=use_dcn_in_phd, use_dubm=use_dubm, use_strg=use_strg)
-            self.up3 = UpBlock(c2, c1, bilinear, skip_channels=c1, use_dcn=use_dcn_in_phd, use_dubm=use_dubm, use_strg=use_strg)
+            
+            # 🔥🔥🔥 [关键修复]：这里必须用 skip_c2，而不是 c2
+            self.up2 = UpBlock(c3, c2, bilinear, skip_channels=skip_c2, use_dcn=use_dcn_in_phd, use_dubm=use_dubm, use_strg=use_strg)
+            
+            # 🔥🔥🔥 [关键修复]：这里必须用 skip_c1，而不是 c1
+            self.up3 = UpBlock(c2, c1, bilinear, skip_channels=skip_c1, use_dcn=use_dcn_in_phd, use_dubm=use_dubm, use_strg=use_strg)
         else:
             self.up1 = UpBlock(c4, c3, bilinear, skip_channels=c3)
-            self.up2 = UpBlock(c3, c2, bilinear, skip_channels=c2)
-            self.up3 = UpBlock(c2, c1, bilinear, skip_channels=c1)
+            # 这里的标准 Decoder 最好也适配一下，虽然你现在主要用 PHD
+            self.up2 = UpBlock(c3, c2, bilinear, skip_channels=skip_c2)
+            self.up3 = UpBlock(c2, c1, bilinear, skip_channels=skip_c1)
 
-        # 最后一层上采样：这里输出了 64 通道
+        # 最后一层
         if bilinear:
             self.up4 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True), DoubleConv(c1, 64))
         else:
             self.up4 = nn.Sequential(nn.ConvTranspose2d(c1, c1 // 2, kernel_size=2, stride=2), DoubleConv(c1 // 2, 64))
         
         self.final_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        
-        # 🔥🔥🔥 [修正] 无论是什么 Decoder，up4 都输出了 64 通道，所以这里统一为 64
         self.outc = OutConv(64, n_classes) 
 
     def forward(self, x):
@@ -216,17 +240,22 @@ class UNet(nn.Module):
             s3 = self.cafm3(s3)
             x4 = self.cafm4(x4)
 
-        # 3. 双流架构
+        # 3. DSIS (如果开启，将改变 s1 和 s2 的通道数为 64)
+        if self.use_dsis:
+            s1, s2 = self.dsis_module(s1, s2)
+
+        # 4. 双流架构
         boundary_logits = None
         if self.use_dual_stream:
             boundary_logits = self.boundary_stream(s1)
-        # 🔥🔥🔥 核心修改：截断梯度 🔥🔥🔥
-            # 我们传给 Decoder 的时候，加上 .detach()
-            # 这样 Decoder 的梯度就不会回传给 boundary_stream
-            # boundary_stream 只依靠最后的 edge_loss 来更新自己
+            # 截断梯度
             edge_prior_for_dubm = boundary_logits.detach()
-        # 4. Decoder
+        else:
+            edge_prior_for_dubm = None
+
+        # 5. Decoder
         if self.decoder_name == 'phd':
+            # 注意：如果 use_dual_stream 是 False，boundary_logits 就是 None，这里传 None 是安全的
             d1 = self.up1(x4, s3, edge_prior=boundary_logits)
             d2 = self.up2(d1, s2, edge_prior=boundary_logits)
             d3 = self.up3(d2, s1, edge_prior=boundary_logits)
@@ -240,7 +269,7 @@ class UNet(nn.Module):
         
         logits = self.outc(d5)
 
-        # 5. 返回逻辑
+        # 6. 返回逻辑
         if self.training and self.use_dual_stream:
             return logits, boundary_logits
         else:
