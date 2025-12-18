@@ -11,7 +11,7 @@ from PIL import Image
 import numpy as np
 
 # 🔥 导入统一版 UNet (确保路径正确)
-from unet.unet_model_unified import UNet
+from unet import UNet
 from utils.data_loading import BasicDataset
 
 # 这里的 Dice 计算函数，如果你 utils 里没有，可以注释掉下面这行
