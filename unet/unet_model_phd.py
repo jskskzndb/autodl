@@ -1,245 +1,199 @@
 """
-unet_model.py
-集成 PHD (Parallel Hybrid Decoder) + ResNet Encoder + WGN (Encoder-Series)
+cnext_fme_unet.py
+----------------------------------------------------------------
+Architecture: ConvNeXt V2 + PHD Decoder + FME (Frequency-Mamba Enhancement)
+Description: 
+    这是你的最终涨点模型。
+    - Encoder: ConvNeXt V2 (Base/Tiny)
+    - Decoder: PHD (Parallel Hybrid Decoder)
+    - Skip: FME (频域 Mamba 增强，可消融)
+----------------------------------------------------------------
 """
 
-from .unet_parts import *
-import sys
-from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import timm
+from pathlib import Path
+import sys
 
-# 添加项目根目录到路径
+# 添加路径以导入 Decoder 模块
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from advanced_cafm_module import Advanced_CAFM
 
-# 1. 导入 WGN (WGN 增强模块)
-from wgn import Wg_nConv_Block
+# 导入核心 PHD 模块
+try:
+    from decoder.hybrid_decoder import PHD_DecoderBlock, VisualStateSpaceBlock
+except ImportError:
+    print("❌ Error: Could not import modules from decoder.hybrid_decoder")
+    PHD_DecoderBlock = None
+    VisualStateSpaceBlock = None
 
-# 🔥 2. [关键修复] 导入你的新解码器 PHD
-from decoder.hybrid_decoder import PHD_DecoderBlock
+# ================================================================
+# 1. 工具类: Haar 小波变换
+# ================================================================
+class HaarWaveletTransform(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def dwt(self, x):
+        x00 = x[:, :, 0::2, 0::2]
+        x01 = x[:, :, 0::2, 1::2]
+        x10 = x[:, :, 1::2, 0::2]
+        x11 = x[:, :, 1::2, 1::2]
+        ll = (x00 + x01 + x10 + x11) / 2
+        lh = (x00 + x01 - x10 - x11) / 2
+        hl = (x00 - x01 + x10 - x11) / 2
+        hh = (x00 - x01 - x10 + x11) / 2
+        return ll, lh, hl, hh
+    def idwt(self, ll, lh, hl, hh):
+        x00 = (ll + lh + hl + hh) / 2
+        x01 = (ll + lh - hl - hh) / 2
+        x10 = (ll - lh + hl - hh) / 2
+        x11 = (ll - lh - hl + hh) / 2
+        out = torch.zeros(ll.size(0), ll.size(1), ll.size(2)*2, ll.size(3)*2, device=ll.device)
+        out[:, :, 0::2, 0::2] = x00
+        out[:, :, 0::2, 1::2] = x01
+        out[:, :, 1::2, 0::2] = x10
+        out[:, :, 1::2, 1::2] = x11
+        return out
 
+# ================================================================
+# 2. 核心涨点模块: FME (Frequency-Mamba Enhancement)
+# ================================================================
+class FME_Block(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.dwt_idwt = HaarWaveletTransform()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.channel_dim = channels
+        
+        # Mamba 序列建模 (2x2 Patch = 4 频段)
+        self.mamba = VisualStateSpaceBlock(dim=channels)
+        
+        # 权重生成
+        self.weight_gen = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
 
-# 🔥 3. [关键修复] 定义 Up_PHD 适配器
-# 用来替代原来的 'Up' 类，把 PHD_DecoderBlock 包装成能进行上采样和拼接的模块
+    def forward(self, x):
+        # x: [B, C, H, W]
+        ll, lh, hl, hh = self.dwt_idwt.dwt(x)
+        
+        # 生成 Token 并堆叠
+        t_ll = self.avg_pool(ll).flatten(1)
+        t_lh = self.avg_pool(lh).flatten(1)
+        t_hl = self.avg_pool(hl).flatten(1)
+        t_hh = self.avg_pool(hh).flatten(1)
+        
+        # [B, C, 4] -> [B, C, 2, 2] (伪装成图片)
+        tokens = torch.stack([t_ll, t_lh, t_hl, t_hh], dim=2) 
+        tokens = tokens.view(x.size(0), self.channel_dim, 2, 2)
+        
+        # Mamba 交互
+        feats_out = self.mamba(tokens) 
+        feats_out = feats_out.view(x.size(0), self.channel_dim, 4)
+        
+        # 生成权重
+        w_ll = self.weight_gen(feats_out[:, :, 0]).view(x.size(0), -1, 1, 1)
+        w_lh = self.weight_gen(feats_out[:, :, 1]).view(x.size(0), -1, 1, 1)
+        w_hl = self.weight_gen(feats_out[:, :, 2]).view(x.size(0), -1, 1, 1)
+        w_hh = self.weight_gen(feats_out[:, :, 3]).view(x.size(0), -1, 1, 1)
+        
+        out = self.dwt_idwt.idwt(ll*w_ll, lh*w_lh, hl*w_hl, hh*w_hh)
+        return out + x
+
+# ================================================================
+# 3. 适配器: Up_PHD (集成 FME 开关)
+# ================================================================
 class Up_PHD(nn.Module):
-    def __init__(self, in_channels, out_channels, bilinear=True, skip_channels=0):
+    def __init__(self, in_channels, out_channels, bilinear=True, skip_channels=0, use_dcn=False, use_fme=False):
         super().__init__()
         
-        # A. 上采样 (Upsample)
+        # 🔥 FME 开关
+        if use_fme and skip_channels > 0:
+            self.fme = FME_Block(skip_channels)
+        else:
+            self.fme = None
+
         if bilinear:
             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            # 双线性插值不改变通道数
             conv_in_channels = in_channels + skip_channels
         else:
             self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-            # 转置卷积会让通道减半
             conv_in_channels = (in_channels // 2) + skip_channels
 
-        # B. 特征融合与解码 (使用 PHD 替代普通 DoubleConv)
-        self.conv = PHD_DecoderBlock(in_channels=conv_in_channels, out_channels=out_channels)
+        # 核心解码
+        self.conv = PHD_DecoderBlock(
+            in_channels=conv_in_channels, 
+            out_channels=out_channels, 
+            use_dcn=use_dcn, 
+            use_dubm=False 
+        )
 
     def forward(self, x1, x2):
-        # x1: 深层特征 (需要上采样)
-        # x2: 跳跃连接特征 (High Res)
         x1 = self.up(x1)
         
-        # 处理尺寸不匹配 (Padding)
+        # Padding
         diffY = x2.size()[2] - x1.size()[2]
         diffX = x2.size()[3] - x1.size()[3]
-        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
-                        diffY // 2, diffY - diffY // 2])
+        if diffX != 0 or diffY != 0:
+            x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
         
-        # 拼接
+        # 🔥 FME 增强
+        if self.fme is not None:
+            x2 = self.fme(x2)
+        
         x = torch.cat([x2, x1], dim=1)
-        
-        # 混合解码
         return self.conv(x)
 
 
-class EdgeDecoder(nn.Module):
-    """
-    边缘解码器：接收 WGN 的高频特征进行边缘重建
-    """
-    def __init__(self):
+# ================================================================
+# 4. 主模型: ConvNeXt + FME + PHD
+# ================================================================
+class CNext_FME_UNet(nn.Module):
+    def __init__(self, n_channels=3, n_classes=1, cnext_type='convnextv2_tiny', 
+                 use_dcn_in_phd=False, use_fme=False, **kwargs):
         super().__init__()
-        # Layer 3 High Freq (1/16 size)
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(3072, 512, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True)
+        
+        print(f"🚀 [CNext-FME-UNet] Initializing...")
+        print(f"   - Encoder: {cnext_type}")
+        print(f"   - FME Module: {'✅ Enabled' if use_fme else '❌ Disabled'}")
+        
+        self.n_classes = n_classes
+        
+        # --- Encoder: ConvNeXt V2 ---
+        self.enc_model = timm.create_model(
+            cnext_type, 
+            pretrained=True, 
+            features_only=True, 
+            out_indices=[0, 1, 2, 3], 
+            in_chans=n_channels
         )
-        # Layer 2 High Freq (1/8 size)
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(512 + 1536, 256, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True)
-        )
-        # Layer 1 High Freq (1/4 size)
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(256 + 768, 64, kernel_size=3, padding=1, bias=False),
+        c1, c2, c3, c4 = self.enc_model.feature_info.channels()
+        
+        # --- Decoder ---
+        self.up1 = Up_PHD(c4, c3, skip_channels=c3, use_dcn=use_dcn_in_phd, use_fme=use_fme)
+        self.up2 = Up_PHD(c3, c2, skip_channels=c2, use_dcn=use_dcn_in_phd, use_fme=use_fme)
+        self.up3 = Up_PHD(c2, c1, skip_channels=c1, use_dcn=use_dcn_in_phd, use_fme=use_fme)
+        
+        # --- Head ---
+        self.final_up = nn.Sequential(
+            nn.Upsample(scale_factor=4, mode='bilinear', align_corners=True),
+            nn.Conv2d(c1, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True)
         )
-        # Final Output
-        self.final_conv = nn.Conv2d(64, 1, kernel_size=1)
-
-    def forward(self, x3_h, x2_h, x1_h):
-        x = self.conv1(self.up1(x3_h))
-        x = torch.cat([x, x2_h], dim=1)
-        x = self.conv2(self.up2(x))
-        x = torch.cat([x, x1_h], dim=1)
-        x = self.conv3(self.up3(x))
-        x = F.interpolate(x, scale_factor=4, mode='bilinear', align_corners=True)
-        return self.final_conv(x)
-
-
-class UNet(nn.Module):
-    def __init__(self, n_channels, n_classes, bilinear=False, use_advanced_cafm=False,
-                 use_resnet_encoder=False, use_wgn_enhancement=False, use_edge_loss=False, wgn_orders=None):
-        super(UNet, self).__init__()
-        self.n_channels = n_channels
-        self.n_classes = n_classes
-        self.bilinear = bilinear
-        self.use_advanced_cafm = use_advanced_cafm
-        self.use_resnet_encoder = use_resnet_encoder
-        self.use_wgn_enhancement = use_wgn_enhancement
-        self.use_edge_loss = use_edge_loss
-        self.checkpointing = False
-
-        if use_resnet_encoder:
-            # ========== ResNet50 Encoder ==========
-            from torchvision.models import resnet50, ResNet50_Weights
-
-            if wgn_orders is None:
-                wgn_orders = {'layer1': (3, 2), 'layer2': (4, 3), 'layer3': (5, 4)}
-
-            resnet = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
-            self.conv1 = resnet.conv1
-            self.bn1 = resnet.bn1
-            self.relu = resnet.relu
-            self.maxpool = resnet.maxpool
-            self.layer1 = resnet.layer1
-            self.layer2 = resnet.layer2
-            self.layer3 = resnet.layer3
-            self.layer4 = resnet.layer4
-
-            # ========== WGN Enhancement (串联在 Encoder 中) ==========
-            if use_wgn_enhancement:
-                self.wgn_enhance1 = Wg_nConv_Block(256, *wgn_orders['layer1'])
-                self.wgn_enhance2 = Wg_nConv_Block(512, *wgn_orders['layer2'])
-                self.wgn_enhance3 = Wg_nConv_Block(1024, *wgn_orders['layer3'])
-
-                if use_edge_loss:
-                    self.edge_decoder = EdgeDecoder()
-
-            # ========== Bottleneck ==========
-            if use_advanced_cafm:
-                self.cafm = Advanced_CAFM(n_feat=2048, n_head=8)
-            else:
-                self.bottleneck_conv = DoubleConv(2048, 2048)
-
-            # ========== Decoder ==========
-            # 🔥 4. [关键修复] 使用 Up_PHD 替代 Up
-            # 只有这里改了，才能用到你的 hybrid_decoder.py
-            self.up1 = Up_PHD(2048, 1024, bilinear, skip_channels=1024)
-            self.up2 = Up_PHD(1024, 512, bilinear, skip_channels=512)
-            self.up3 = Up_PHD(512, 256, bilinear, skip_channels=256)
-            self.up4 = Up_PHD(256, 128, bilinear, skip_channels=64)
-
-            self.final_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            self.final_conv_block = DoubleConv(128, 64)
-            self.outc = OutConv(64, n_classes)
-
-        else:
-            # ========== Standard Encoder ==========
-            self.inc = (DoubleConv(n_channels, 64))
-            self.down1 = (Down(64, 128))
-            self.down2 = (Down(128, 256))
-            self.down3 = (Down(256, 512))
-            factor = 2 if bilinear else 1
-            self.down4 = (Down(512, 1024 // factor))
-
-            if self.use_advanced_cafm:
-                bottleneck_channels = 1024 // factor
-                self.advanced_cafm_bottleneck = Advanced_CAFM(n_feat=bottleneck_channels)
-
-            # 这里可以保留标准解码器，作为 Baseline 对比
-            self.up1 = (Up(1024, 512 // factor, bilinear))
-            self.up2 = (Up(512, 256 // factor, bilinear))
-            self.up3 = (Up(256, 128 // factor, bilinear))
-            self.up4 = (Up(128, 64, bilinear))
-            self.outc = (OutConv(64, n_classes))
+        self.outc = nn.Conv2d(64, n_classes, kernel_size=1)
 
     def forward(self, x):
-        if self.use_resnet_encoder:
-            # ... (这部分逻辑是你原本的逻辑，保持不变) ...
-            x0 = self.relu(self.bn1(self.conv1(x)))
-            x_stem = self.maxpool(x0)
+        features = self.enc_model(x)
+        s1, s2, s3, x4 = features[0], features[1], features[2], features[3]
 
-            x1 = self.layer1(x_stem)
-            x1_high = None
-            if self.use_wgn_enhancement:
-                x1, x1_high = self.wgn_enhance1(x1)
-
-            x2 = self.layer2(x1)
-            x2_high = None
-            if self.use_wgn_enhancement:
-                x2, x2_high = self.wgn_enhance2(x2)
-
-            x3 = self.layer3(x2)
-            x3_high = None
-            if self.use_wgn_enhancement:
-                x3, x3_high = self.wgn_enhance3(x3)
-
-            x4 = self.layer4(x3)
-
-            s3, s2, s1, s0 = x3, x2, x1, x0
-
-            if self.use_advanced_cafm:
-                x_bot = self.cafm(x4)
-            else:
-                x_bot = self.bottleneck_conv(x4)
-
-            d1 = self.up1(x_bot, s3)
-            d2 = self.up2(d1, s2)
-            d3 = self.up3(d2, s1)
-            d4 = self.up4(d3, s0)
-
-            d5 = self.final_up(d4)
-            d5 = self.final_conv_block(d5)
-            logits = self.outc(d5)
-
-            if self.training and self.use_wgn_enhancement and self.use_edge_loss:
-                logits_edge = self.edge_decoder(x3_high, x2_high, x1_high)
-                return logits, logits_edge
-            else:
-                return logits
-
-        else:
-            # Standard UNet Forward (保持不变)
-            x1 = self.inc(x)
-            x2 = self.down1(x1)
-            x3 = self.down2(x2)
-            x4 = self.down3(x3)
-            x5 = self.down4(x4)
-            
-            if self.use_advanced_cafm:
-                x5 = self.advanced_cafm_bottleneck(x5)
-                
-            x = self.up1(x5, x4)
-            x = self.up2(x, x3)
-            x = self.up3(x, x2)
-            x = self.up4(x, x1)
-            logits = self.outc(x)
-            return logits
-
-    def use_checkpointing(self):
-        self.checkpointing = True
-
-    def disable_checkpointing(self):
-        self.checkpointing = False
+        d1 = self.up1(x4, s3)
+        d2 = self.up2(d1, s2)
+        d3 = self.up3(d2, s1)
+        
+        d4 = self.final_up(d3)
+        return self.outc(d4)

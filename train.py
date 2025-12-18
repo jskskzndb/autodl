@@ -17,8 +17,7 @@ from utils.dice_score import dice_loss
 from utils.losses import FocalLoss, CombinedLoss, DiceLossOnly
 from utils.utils import log_grad_stats
 
-# 🔥 导入统一模型类
-from unet.unet_model_unified import UNet
+from unet import UNet
 
 # ================= 配置路径 =================
 dir_img = Path('./data/train/imgs/')
@@ -439,11 +438,13 @@ def get_args():
     parser.add_argument('--use-dual-stream', action='store_true', default=False, help='Enable Dual-Stream Boundary Architecture')
     
     parser.add_argument('--use-dsis', action='store_true', default=False, help='Enable Dual-Stream Interactive Skip Module')
+    parser.add_argument('--use-unet3p', action='store_true', default=False, help='Enable UNet 3+ Full-Scale Skip Connections')
     # 其他增强模块 (保持原有开关定义，但移除了旧版 Edge Logic 的执行)
     parser.add_argument('--use-wgn-enhancement', action='store_true', default=False)
     parser.add_argument('--use-cafm', action='store_true', default=False)
     parser.add_argument('--use-edge-loss', action='store_true', default=False, help='Legacy WGN Edge Loss (Deprecated logic removed)')
-    
+    parser.add_argument('--use-fme', action='store_true', default=False, 
+                        help='Enable Frequency-Mamba Enhancement (FME) module')
     # WGN 参数
     parser.add_argument('--wgn-base-order', type=int, default=3)
     parser.add_argument('--wgn-orders', type=str, default=None)
@@ -494,7 +495,9 @@ if __name__ == '__main__':
         use_dubm=args.use_dubm,
         use_strg=args.use_strg,
         use_dual_stream=args.use_dual_stream, # 🔥 新增双流
-        use_dsis=args.use_dsis # 🔥 传入参数
+        use_dsis=args.use_dsis, # 🔥 传入参数
+        use_unet3p=args.use_unet3p # 🔥 传入参数
+        use_fme=args.use_fme
     )
     
     model = model.to(memory_format=torch.channels_last)

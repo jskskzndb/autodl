@@ -102,3 +102,19 @@ class PHD_DecoderBlock(nn.Module):
             
         feat_global = self.global_branch(x)
         return self.fusion(feat_local, feat_global)
+        # ================================================================
+# 5. [新增] VisualStateSpaceBlock 
+# (这是为了适配 wvm_unet.py 的调用接口)
+# ================================================================
+class VisualStateSpaceBlock(nn.Module):
+    """
+    WVM 模型需要的接口包装器。
+    它接收 'dim' 参数，并在内部调用 OmniMambaBlock。
+    """
+    def __init__(self, dim):
+        super().__init__()
+        # WVM 传入的是 dim (例如 256)，OmniMambaBlock 接收 in/out channels
+        self.block = OmniMambaBlock(in_channels=dim, out_channels=dim)
+
+    def forward(self, x):
+        return self.block(x)

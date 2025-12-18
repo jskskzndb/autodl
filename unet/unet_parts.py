@@ -98,3 +98,90 @@ class OutConv(nn.Module):
 
     def forward(self, x):
         return self.conv(x) # 输出每个像素的各类得分（logits）
+
+
+# ==========================================
+# UNet 3+ Core Module (Full-Scale Aggregator)
+# ==========================================
+class UNet3P_Aggregator(nn.Module):
+    def __init__(self, current_level, total_levels, enc_channels_list, prev_dec_channels, cat_channels=64):
+        """
+        current_level: 当前解码层级索引 (0: s1分辨率, 1: s2分辨率, 2: s3分辨率...)
+                       注意：为了配合 ConvNeXt 的 [s1, s2, s3, x4] 列表:
+                       Level 0 对应 s1 (H/4)  <- Decoder 最终输出层
+                       Level 1 对应 s2 (H/8)
+                       Level 2 对应 s3 (H/16)
+                       Level 3 对应 x4 (H/32) <- 这是 Bottleneck，不作为 Decoder 目标
+        total_levels: 总层数 (通常为 4)
+        enc_channels_list: Encoder 通道列表 [c1, c2, c3, c4]
+        prev_dec_channels: 上一级 Decoder 输出的通道数
+        cat_channels: UNet 3+ 统一压缩通道数 (默认 64)
+        """
+        super().__init__()
+        self.current_level = current_level
+        self.cat_channels = cat_channels
+        
+        # 1. 处理 Encoder 特征 (全尺度)
+        self.enc_convs = nn.ModuleList()
+        for i, c_in in enumerate(enc_channels_list):
+            self.enc_convs.append(nn.Sequential(
+                nn.Conv2d(c_in, cat_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(cat_channels),
+                nn.ReLU(inplace=True)
+            ))
+            
+        # 2. 处理 Previous Decoder 特征
+        # 上一级 Decoder 肯定是更深层的 (Scale 更小)，所以需要 UpSample
+        self.dec_conv = nn.Sequential(
+            nn.Conv2d(prev_dec_channels, cat_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(cat_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 3. 最大池化层 (用于处理更浅层的 Encoder)
+        self.max_pools = nn.ModuleList()
+        for i in range(total_levels):
+            if i < current_level:
+                # 浅层 (大图) -> 深层 (小图): 需要下采样
+                # 比如 i=0(s1), current=2(s3). s1->s3 需要 4倍下采样
+                stride = 2 ** (current_level - i)
+                self.max_pools.append(nn.MaxPool2d(kernel_size=stride, stride=stride, ceil_mode=True))
+            else:
+                self.max_pools.append(nn.Identity())
+
+    def forward(self, prev_dec_feat, enc_feats_list):
+        """
+        prev_dec_feat: 来自上一级 Decoder 的特征
+        enc_feats_list: [s1, s2, s3, x4]
+        """
+        target_h, target_w = enc_feats_list[self.current_level].shape[2:]
+        feat_list = []
+        
+        # A. 遍历所有 Encoder 特征
+        for i, feat in enumerate(enc_feats_list):
+            # 1. 预处理 (Conv 统一通道)
+            x = self.enc_convs[i](feat)
+            
+            # 2. 尺度对齐
+            if i < self.current_level:
+                # 来源是浅层 (s1) -> 目标是深层 (s3): 下采样
+                x = self.max_pools[i](x)
+            elif i > self.current_level:
+                # 来源是深层 (x4) -> 目标是浅层 (s3): 上采样
+                x = F.interpolate(x, size=(target_h, target_w), mode='bilinear', align_corners=True)
+            # i == current_level: 直接使用，不做尺寸变换
+            
+            # 双重保险: 确保尺寸绝对对齐 (防止除不尽)
+            if x.shape[2:] != (target_h, target_w):
+                x = F.interpolate(x, size=(target_h, target_w), mode='bilinear', align_corners=True)
+                
+            feat_list.append(x)
+            
+        # B. 处理 Previous Decoder 特征 (深层 -> 浅层)
+        x_dec = self.dec_conv(prev_dec_feat)
+        x_dec = F.interpolate(x_dec, size=(target_h, target_w), mode='bilinear', align_corners=True)
+        feat_list.append(x_dec)
+        
+        # C. 拼接 (UNet 3+ 核心)
+        # 输出通道数 = (Encoder层数 + 1) * cat_channels
+        return torch.cat(feat_list, dim=1)
