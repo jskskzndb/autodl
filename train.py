@@ -75,6 +75,8 @@ def train_model(
         focal_gamma: float = 2.0,
         optimizer_type: str = 'adamw',
         backbone_lr_scale: float = 0.1,
+        lambda_edge: float = 20.0,
+        lambda_body: float = 1.0,
 ):
     # 1. 数据准备
     train_dataset = BasicDataset(dir_img, dir_mask, img_scale, mask_suffix='')
@@ -193,36 +195,47 @@ def train_model(
                 with torch.cuda.amp.autocast(enabled=amp):
                     output = model(images)
                     
-                    # 🔥 双流架构逻辑 (Tuple 处理)
+                    # -----------------------------------------------------------
+                    # 🔥 新版逻辑：只支持 3输出 (MDBES) 或 1输出 (Baseline)
+                    # -----------------------------------------------------------
                     if isinstance(output, tuple):
-                        # === 双流模式 (Mask, Edge) ===
-                        masks_pred = output[0]
-                        edges_pred = output[1]
+                        # === [模式 A] MDBES-Net 解耦模式 (Seg, Body, Edge) ===
+                        # 只要是 tuple，就默认一定是 3 个输出
+                        masks_pred, body_pred, edge_pred = output
                         
-                        # 1. 主分割 Loss
-                        loss_seg = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
+                        # 1. 准备真值 (GT)
+                        true_edges = generate_edge_tensor(true_masks) 
                         
-                        # 2. 边缘 Loss
-                        true_edges = generate_edge_tensor(true_masks) # 使用新版高效算子
+                        # Body GT = Mask - Edge (利用广播机制)
+                        true_masks_float = true_masks.unsqueeze(1).float()
+                        true_body = true_masks_float - true_edges
+                        true_body = torch.clamp(true_body, 0, 1)
+
+                        # 2. 尺寸对齐 (防止预测图和真值尺寸不一致)
+                        if edge_pred.shape[2:] != true_edges.shape[2:]:
+                            edge_pred = F.interpolate(edge_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
+                            body_pred = F.interpolate(body_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
+
+                        # 3. 计算 Loss (三合一)
                         
-                        # 尺寸对齐
-                        if edges_pred.shape[2:] != true_edges.shape[2:]:
-                            edges_pred = F.interpolate(edges_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
+                        # (1) 主分割 Loss
+                        l_seg = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
                         
-                        # 边缘 BCE Loss (PosWeight=5.0)
-                        loss_edge = F.binary_cross_entropy_with_logits(
-                            edges_pred, true_edges, pos_weight=torch.tensor([5.0], device=device)
+                        # (2) 主体 Loss (BCE)
+                        l_body = F.binary_cross_entropy_with_logits(body_pred, true_body)
+                        
+                        # (3) 边缘 Loss (BCE + 权重)
+                        l_edge = F.binary_cross_entropy_with_logits(
+                            edge_pred, true_edges, pos_weight=torch.tensor([5.0], device=device)
                         )
                         
-                        # 联合 Loss
-                        loss = loss_seg + 0.3 * loss_edge
-                        
+                        # 4. 总 Loss 加权 (使用传入的 lambda 参数)
+                        loss = l_seg + (lambda_body * l_body) + (lambda_edge * l_edge)
+
                     else:
-                        # === 普通模式 ===
-                        # ⚡️ 这里已删除旧版 WGN 边缘解码器的逻辑，只保留纯分割 Loss
+                        # === [模式 B] 普通 Baseline 模式 (1个输出) ===
                         masks_pred = output
                         loss = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
-
                 # 异常检测
                 if torch.isnan(loss) or torch.isinf(loss):
                     logging.error(f'Loss NaN/Inf detected: {loss.item()}. Skipping batch.')
@@ -285,6 +298,7 @@ def train_model(
         )
 
         # 5. 上传 WandB 日志
+        current_lr = optimizer.param_groups[0]['lr']
         experiment.log({
             'train/epoch_loss': avg_epoch_loss,
             'train/avg_grad_norm': avg_grad_norm,
@@ -294,7 +308,9 @@ def train_model(
             'val/precision': val_metrics['precision'],
             'val/recall': val_metrics['recall'],
             'val/best_dice': threshold_res['best_dice'],
-            'val/best_f1': threshold_res['best_f1']
+            'val/best_f1': threshold_res['best_f1'],
+            'epoch': epoch,                        # 🔥 新增: 当前轮次
+            'train/learning_rate': current_lr      # 🔥 新增: 当前学习率曲线
         })
 
         # 6. WandB 图片可视化 (适配双流输出)
@@ -383,10 +399,7 @@ def train_model(
             if save_best:
                 torch.save(checkpoint, best_path)
 
-            # Periodic
-            if epoch % 10 == 0 or epoch == epochs:
-                torch.save(checkpoint, str(dir_checkpoint / f'checkpoint_epoch{epoch}.pth'))
-
+            
     wandb.finish()
 
 # 计算 Loss 辅助函数 (保持不变)
@@ -439,6 +452,11 @@ def get_args():
     
     parser.add_argument('--use-dsis', action='store_true', default=False, help='Enable Dual-Stream Interactive Skip Module')
     parser.add_argument('--use-unet3p', action='store_true', default=False, help='Enable UNet 3+ Full-Scale Skip Connections')
+    # [新增] MDBES-Net 相关参数
+    parser.add_argument('--use_decouple', action='store_true', default=False, help='Enable MDBES-Net explicit decoupling supervision')
+    parser.add_argument('--lambda_edge', type=float, default=20.0, help='Weight for the Edge loss (default: 20.0)')
+    parser.add_argument('--lambda_body', type=float, default=1.0, help='Weight for the Body loss (default: 1.0)')
+    
     # 其他增强模块 (保持原有开关定义，但移除了旧版 Edge Logic 的执行)
     parser.add_argument('--use-wgn-enhancement', action='store_true', default=False)
     parser.add_argument('--use-cafm', action='store_true', default=False)
@@ -496,8 +514,9 @@ if __name__ == '__main__':
         use_strg=args.use_strg,
         use_dual_stream=args.use_dual_stream, # 🔥 新增双流
         use_dsis=args.use_dsis, # 🔥 传入参数
-        use_unet3p=args.use_unet3p # 🔥 传入参数
-        use_fme=args.use_fme
+        use_unet3p=args.use_unet3p, # 🔥 传入参数
+        use_fme=args.use_fme,
+        use_decouple=args.use_decouple,  # 🔥 传入 MDBES-Net 解耦参数
     )
     
     model = model.to(memory_format=torch.channels_last)
@@ -538,7 +557,10 @@ if __name__ == '__main__':
             loss_weights=args.loss_weights,
             focal_alpha=args.focal_alpha,
             focal_gamma=args.focal_gamma,
-            optimizer_type=args.optimizer
+            optimizer_type=args.optimizer,
+            # 🔥 [新增] 把权重传给训练函数
+            lambda_edge=args.lambda_edge,
+            lambda_body=args.lambda_body
         )
     except KeyboardInterrupt:
         torch.save(model.state_dict(), 'INTERRUPTED.pth')

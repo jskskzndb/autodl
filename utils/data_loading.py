@@ -13,15 +13,15 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 
+# 修改后 (强制 .convert('RGB'))
 def load_image(filename):
     ext = splitext(filename)[1]
     if ext == '.npy':
-        return Image.fromarray(np.load(filename))
+        return Image.fromarray(np.load(filename)).convert('RGB')
     elif ext in ['.pt', '.pth']:
-        return Image.fromarray(torch.load(filename).numpy())
+        return Image.fromarray(torch.load(filename).numpy()).convert('RGB')
     else:
-        return Image.open(filename)
-
+        return Image.open(filename).convert('RGB')
 
 def unique_mask_values(idx, mask_dir, mask_suffix):
     mask_file = list(mask_dir.glob(idx + mask_suffix + '.*'))[0]
@@ -80,13 +80,25 @@ class BasicDataset(Dataset):
             return mask
 
         else:
+            # === 图片处理逻辑大改 ===
+            # 1. 维度调整：把 (H, W, C) 转为 (C, H, W)
             if img.ndim == 2:
                 img = img[np.newaxis, ...]
             else:
                 img = img.transpose((2, 0, 1))
 
+            # 2. 归一化到 [0, 1]
             if (img > 1).any():
                 img = img / 255.0
+
+            # 3. 【新增】ImageNet 标准化
+            # 定义标准参数 (C, 1, 1) 以便广播计算
+            mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+            std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+
+            # 执行标准化 (Z-Score)
+            # 结果范围会变成约 [-2, 2.6]，且包含负数
+            img = (img - mean) / std
 
             return img
 
