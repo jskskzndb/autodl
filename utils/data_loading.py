@@ -11,7 +11,7 @@ from os.path import splitext, isfile, join
 from pathlib import Path
 from torch.utils.data import Dataset
 from tqdm import tqdm
-
+import albumentations as A  # 🔥 [新增1] 导入增强库
 
 # 修改后 (强制 .convert('RGB'))
 def load_image(filename):
@@ -36,12 +36,13 @@ def unique_mask_values(idx, mask_dir, mask_suffix):
 
 
 class BasicDataset(Dataset):
-    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = ''):
+    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = '', augment: bool = False):
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
         assert 0 < scale <= 1, 'Scale must be between 0 and 1'
         self.scale = scale
         self.mask_suffix = mask_suffix
+        self.augment = augment
 
         self.ids = [splitext(file)[0] for file in listdir(images_dir) if isfile(join(images_dir, file)) and not file.startswith('.')]
         if not self.ids:
@@ -49,13 +50,38 @@ class BasicDataset(Dataset):
 
         logging.info(f'Creating dataset with {len(self.ids)} examples')
         logging.info('Scanning mask files to determine unique values')
-        with Pool() as p:
-            unique = list(tqdm(
-                p.imap(partial(unique_mask_values, mask_dir=self.mask_dir, mask_suffix=self.mask_suffix), self.ids),
-                total=len(self.ids)
-            ))
+        logging.info('🚀 跳过扫描，使用固定掩码值: [0, 255]')
+        self.mask_values = [0, 255]
+        # ============================================================
+        # 🔥 [新增3] 定义增强流水线 (仅当 augment=True 时初始化)
+        # ============================================================
+        if self.augment:
+            self.transform = A.Compose([
+                # --- 几何变换：打破位置记忆 ---
+                A.HorizontalFlip(p=0.5),      # 水平翻转
+                A.VerticalFlip(p=0.5),        # 垂直翻转
+                A.RandomRotate90(p=0.5),      # 90度旋转
+                
+                # --- 像素变换：适应不同光照 ---
+                A.RandomBrightnessContrast(p=0.2), 
+                
+                # --- Mamba 特训核心：挖孔训练 (CoarseDropout) ---
+                # 随机在原图上挖掉正方形黑洞，但【不挖 Mask】
+                # 强迫模型通过 Mamba 的长距离扫描能力，结合上下文推断被遮挡的部分
+                # 适配 Albumentations 2.x 版本
+                A.CoarseDropout(
+                    num_holes_range=(1, 8),       # 对应原来的 min_holes, max_holes
+                    hole_height_range=(10, 32),   # 对应原来的 max_height (设个下限防止洞太小)
+                    hole_width_range=(10, 32),    # 对应原来的 max_width
+                    fill_value=0,                 # 填黑色
+                    mask_fill_value=None,         # Mask不挖
+                    p=0.3
+            ),
+            ])
+        # ============================================================
 
-        self.mask_values = list(sorted(np.unique(np.concatenate(unique), axis=0).tolist()))
+    def __len__(self):
+        return len(self.ids)
         logging.info(f'Unique mask values: {self.mask_values}')
 
     def __len__(self):
@@ -114,6 +140,23 @@ class BasicDataset(Dataset):
 
         assert img.size == mask.size, \
             f'Image and mask {name} should be the same size, but are {img.size} and {mask.size}'
+        # ============================================================
+        # 🔥 [新增4] 应用增强逻辑 (拦截处理)
+        # ============================================================
+        if self.augment:
+            # A. PIL -> Numpy (Albumentations 需要 Numpy 格式)
+            img_np = np.array(img)
+            mask_np = np.array(mask)
+            
+            # B. 执行增强 (image 和 mask 自动同步变换)
+            augmented = self.transform(image=img_np, mask=mask_np)
+            img_np = augmented['image']
+            mask_np = augmented['mask']
+            
+            # C. Numpy -> PIL (转回去，无缝对接原本的 preprocess)
+            img = Image.fromarray(img_np)
+            mask = Image.fromarray(mask_np)
+        # ============================================================
 
         img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
         mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)

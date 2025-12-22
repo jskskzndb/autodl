@@ -209,7 +209,7 @@ class WVM_Upsampler(nn.Module):
 # ================================================================
 class WVM_UNet(nn.Module):
     # **kwargs 用于接收并忽略不需要的参数 (如 use_dsis 等)
-    def __init__(self, n_channels=3, n_classes=1, cnext_type='convnextv2_tiny', use_decouple=False, **kwargs):
+    def __init__(self, n_channels=3, n_classes=1, cnext_type='convnextv2_base', use_decouple=False, **kwargs):
         super().__init__()
         self.use_decouple = use_decouple  # 保存开关状态
         use_dcn = kwargs.get('use_dcn', False)

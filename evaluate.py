@@ -8,7 +8,7 @@ from utils.dice_score import multiclass_dice_coeff, dice_coeff
 _EPS = 1e-6
 
 @torch.inference_mode()
-def evaluate(net, dataloader, device, amp, verbose=False):
+def evaluate(net, dataloader, device, amp, criterion=None, verbose=False):
     """
     评估模型在验证集上的表现，返回一个包含多种指标的字典。
     
@@ -41,7 +41,7 @@ def evaluate(net, dataloader, device, amp, verbose=False):
     total_tp = 0.0
     total_fp = 0.0
     total_fn = 0.0
-
+    total_val_loss = 0.0  # <--- 新增：累计 Loss
     # 遍历验证集
     with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
         for batch in tqdm(dataloader, total=num_val_batches, desc='Validation round', unit='batch', leave=False):
@@ -56,7 +56,20 @@ def evaluate(net, dataloader, device, amp, verbose=False):
             if isinstance(mask_pred, tuple): mask_pred = mask_pred[0]
             # 裁剪logits防止数值问题（与训练时保持一致）
             mask_pred = torch.clamp(mask_pred, min=-50, max=50)
-
+            # --- 2. 新增：计算 Validation Loss ---
+            if criterion is not None:
+                # 【严谨逻辑】维度对齐与类型转换
+                # 必须与 train.py 中 calc_loss 的处理逻辑保持严格一致：
+                # 1. 如果预测值包含 Channel 维度 (B, 1, H, W)，必须 squeeze 掉，变成 (B, H, W)
+                #    这是因为 PyTorch 的 BCEWithLogitsLoss 和我们定义的 CombinedLoss 均期望输入与 Target 形状完全一致
+                pred_for_loss = mask_pred.squeeze(1) if mask_pred.dim() == 4 else mask_pred
+                
+                # 2. 真实标签必须转为 float 类型以匹配 Loss 函数的输入要求
+                true_for_loss = mask_true.float()
+                
+                # 3. 计算并累加 Loss
+                loss_val = criterion(pred_for_loss, true_for_loss)
+                total_val_loss += loss_val.item()
             # ---------- 二分类情况 ----------
             # 要求真值是 0/1（如果不是，需要你预处理成 0/1）
             assert mask_true.min() >= 0 and mask_true.max() <= 1, 'True mask indices should be in [0, 1]'
@@ -84,13 +97,17 @@ def evaluate(net, dataloader, device, amp, verbose=False):
     precision = (total_tp + _EPS) / (total_tp + total_fp + _EPS)
     recall = (total_tp + _EPS) / (total_tp + total_fn + _EPS)
     f1 = (2 * precision * recall + _EPS) / (precision + recall + _EPS)
-
+    # 🔥🔥🔥 【补上这一行！】 🔥🔥🔥
+    # 计算平均 Loss：总 Loss / 总批次
+    # 如果 num_val_batches 为 0 (防除零)，就除以 1
+    avg_loss = total_val_loss / max(num_val_batches, 1)
     metrics = {
         'dice': float(dice),
         'iou': float(iou),
         'precision': float(precision),
         'recall': float(recall),
         'f1': float(f1),
+        'loss': float(avg_loss)
     }
     
     # 如果启用详细输出，在控制台打印指标

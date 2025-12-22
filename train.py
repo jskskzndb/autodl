@@ -19,6 +19,74 @@ from utils.utils import log_grad_stats
 
 from unet import UNet
 
+import random
+
+def log_best_visuals(model, val_loader, device, num_samples=5):
+    """
+    将 原图、预测掩码、真值掩码 并排展示在 WandB 表格中。
+    自动处理反标准化，防止原图变黑。
+    """
+    model.eval()
+    
+    # 1. 定义 ImageNet 的均值和方差 (用于反标准化)
+    # 如果你在 dataset 里用了其他数值，请在这里修改
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(device)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(device)
+
+    # 2. 创建 WandB 表格，定义三列
+    columns = ["Input Image (原图)", "Prediction (预测)", "Ground Truth (真值)"]
+    test_table = wandb.Table(columns=columns)
+
+    print(f"✨ 正在生成 {num_samples} 组可视化样本...")
+
+    with torch.no_grad():
+        for i, batch in enumerate(val_loader):
+            if len(test_table.data) >= num_samples: break
+            
+            imgs = batch['image'].to(device)
+            masks = batch['mask'].to(device)
+            
+            # 推理
+            outputs = model(imgs)
+            probs = torch.sigmoid(outputs)
+            preds = (probs > 0.5).float()
+            
+            for j in range(imgs.shape[0]):
+                if len(test_table.data) >= num_samples: break
+                
+                # --- A. 修复原图 (防止全黑的核心步骤) ---
+                # 1. 反标准化: image = image * std + mean
+                img_tensor = imgs[j] * std + mean
+                # 2. 限制数值范围在 0-1 之间 (消除计算误差导致的越界)
+                img_tensor = torch.clamp(img_tensor, 0, 1)
+                # 3. 转换维度 [C,H,W] -> [H,W,C] 并转为 numpy
+                img_np = img_tensor.cpu().numpy().transpose(1, 2, 0)
+                # 4. 乘以 255 并转为整数 (变成标准的 RGB 图片)
+                img_np = (img_np * 255).astype(np.uint8)
+
+                # --- B. 处理掩码 (变成黑白图) ---
+                # 1. 取出单张掩码
+                pred_mask = preds[j].squeeze().cpu().numpy()
+                true_mask = masks[j].squeeze().cpu().numpy()
+                
+                # 2. 乘以 255！(非常重要：0变成黑，1变成白)
+                pred_mask = (pred_mask * 255).astype(np.uint8)
+                true_mask = (true_mask * 255).astype(np.uint8)
+                
+                # --- C. 创建 WandB 图片对象 ---
+                input_img_log = wandb.Image(img_np)
+                pred_img_log = wandb.Image(pred_mask)
+                true_img_log = wandb.Image(true_mask)
+                
+                # --- D. 添加到表格的一行中 ---
+                test_table.add_data(input_img_log, pred_img_log, true_img_log)
+
+    # 3. 上传表格
+    wandb.log({"Visual Results Table": test_table}, commit=False)
+    print("✅ 可视化表格已上传！")
+    
+    model.train() # 恢复训练模式
+
 # ================= 配置路径 =================
 dir_img = Path('./data/train/imgs/')
 dir_mask = Path('./data/train/masks/')
@@ -77,10 +145,11 @@ def train_model(
         backbone_lr_scale: float = 0.1,
         lambda_edge: float = 20.0,
         lambda_body: float = 1.0,
+        
 ):
     # 1. 数据准备
-    train_dataset = BasicDataset(dir_img, dir_mask, img_scale, mask_suffix='')
-    val_dataset = BasicDataset(val_dir_img, val_dir_mask, img_scale, mask_suffix='')
+    train_dataset = BasicDataset(dir_img, dir_mask, img_scale, mask_suffix='', augment=True)
+    val_dataset = BasicDataset(val_dir_img, val_dir_mask, img_scale, mask_suffix='', augment=False)
     n_train = len(train_dataset)
     n_val = len(val_dataset)
 
@@ -148,7 +217,7 @@ def train_model(
                                   momentum=momentum, foreach=True)
         logging.info('✅ Using RMSprop optimizer')
 
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-7)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-9)
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
     # 损失函数
@@ -268,9 +337,10 @@ def train_model(
         # ====== 验证与评估 ======
         avg_epoch_loss = epoch_loss / max(batch_count, 1)
         avg_grad_norm = sum(epoch_grad_norms) / len(epoch_grad_norms) if epoch_grad_norms else 0.0
+        # 🔴 [修改 1] 传入 criterion
+        # 注意：这里我们使用定义好的 criterion 计算 loss
+        val_metrics = evaluate(model, val_loader, device, amp, criterion=criterion)
         
-        # 1. 常规验证
-        val_metrics = evaluate(model, val_loader, device, amp)
         
         # 2. 阈值扫描
         logging.info('Starting threshold scanning...')
@@ -286,7 +356,8 @@ def train_model(
         # 4. 详细控制台输出
         logging.info(
             f'Epoch {epoch}/{epochs} completed - '
-            f'Avg Loss: {avg_epoch_loss:.4f}, '
+            f'Train Loss: {avg_epoch_loss:.4f}, '
+            f'Val Loss: {val_metrics["loss"]:.4f}, '
             f'Avg Grad Norm: {avg_grad_norm:.4f}, '
             f'Val Dice: {val_metrics["dice"]:.4f}, '
             f'Val IoU: {val_metrics["iou"]:.4f}, '
@@ -301,6 +372,7 @@ def train_model(
         current_lr = optimizer.param_groups[0]['lr']
         experiment.log({
             'train/epoch_loss': avg_epoch_loss,
+            'val/loss': val_metrics['loss'],       # <--- 关键！添加这一行！
             'train/avg_grad_norm': avg_grad_norm,
             'val/dice': val_metrics['dice'],
             'val/iou': val_metrics['iou'],
@@ -313,50 +385,7 @@ def train_model(
             'train/learning_rate': current_lr      # 🔥 新增: 当前学习率曲线
         })
 
-        # 6. WandB 图片可视化 (适配双流输出)
-        with torch.no_grad():
-            val_loader_list = list(val_loader)
-            num_samples = min(5, len(val_loader_list))
-            selected_batch_indices = random.sample(range(len(val_loader_list)), num_samples)
-            
-            comparison_images = []
-            for idx in selected_batch_indices:
-                batch = val_loader_list[idx]
-                imgs, masks = batch['image'], batch['mask']
-                imgs = imgs.to(device, dtype=torch.float32, memory_format=torch.channels_last)
-                masks = masks.to(device, dtype=torch.long)
-                
-                single_img = imgs[0:1]
-                
-                with torch.cuda.amp.autocast(enabled=amp):
-                    output = model(single_img)
-                    
-                    # 适配可视化
-                    if isinstance(output, tuple):
-                        pred_mask = output[0]
-                        pred_edge = output[1]
-                    else:
-                        pred_mask = output
-                        # 如果没有边缘输出，生成全黑图占位，防止报错
-                        pred_edge = torch.zeros_like(pred_mask) - 100.0 
-                
-                pred_binary = (torch.sigmoid(pred_mask) > 0.5).to(torch.uint8)
-                edge_vis = torch.sigmoid(pred_edge)[0].detach().cpu()
-                
-                comparison_images.append({
-                    'input': single_img[0].detach().cpu(),
-                    'true_mask': masks[0].detach().cpu().numpy().astype('uint8'),
-                    'pred_mask': pred_binary[0].detach().cpu().numpy().astype('uint8'),
-                    'pred_edge': edge_vis.numpy().astype('uint8')
-                })
         
-        for i, img_data in enumerate(comparison_images):
-            experiment.log({
-                f'examples/sample_{i+1}_input': wandb.Image(img_data['input']),
-                f'examples/sample_{i+1}_true_mask': wandb.Image(img_data['true_mask']),
-                f'examples/sample_{i+1}_pred_mask': wandb.Image(img_data['pred_mask']),
-                f'examples/sample_{i+1}_pred_edge': wandb.Image(img_data['pred_edge']),
-            })
 
         # ====== 保存 Checkpoint ======
         if save_checkpoint:
@@ -395,9 +424,14 @@ def train_model(
                         logging.info(f'   (当前 Dice {current_dice:.4f} 未超过最佳 {prev_best:.4f})')
                 except:
                     save_best = True
-
+            # 🔥 如果是最佳模型：保存权重 + 上传高清图片
             if save_best:
                 torch.save(checkpoint, best_path)
+                try:
+                    # 调用我们写好的可视化函数
+                    log_best_visuals(model, val_loader, device, num_samples=5)
+                except Exception as e:
+                    logging.warning(f"⚠️ 可视化上传失败: {e}")
 
             
     wandb.finish()
@@ -515,8 +549,8 @@ if __name__ == '__main__':
         use_dual_stream=args.use_dual_stream, # 🔥 新增双流
         use_dsis=args.use_dsis, # 🔥 传入参数
         use_unet3p=args.use_unet3p, # 🔥 传入参数
-        use_fme=args.use_fme,
-        use_decouple=args.use_decouple,  # 🔥 传入 MDBES-Net 解耦参数
+        
+          # 🔥 传入 MDBES-Net 解耦参数
     )
     
     model = model.to(memory_format=torch.channels_last)
