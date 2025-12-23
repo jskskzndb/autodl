@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import sys
+import numpy as np  # <--- 添加这一行
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

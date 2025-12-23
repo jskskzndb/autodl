@@ -157,7 +157,7 @@ class WVM_Upsampler(nn.Module):
         self.skip_proj = nn.Conv2d(skip_channels, self.mid_channels, 1)
         
         # 融合层 (输入 4 个分量)
-        self.fusion_conv = nn.Conv2d(self.mid_channels * 4, self.mid_channels * 4, 1)
+        #self.fusion_conv = nn.Conv2d(self.mid_channels * 4, self.mid_channels * 4, 1)
         
         # 🔥🔥🔥 新增：空间对齐模块 (Strip Convolution) 🔥🔥🔥
         # 放在融合之后，Mamba 之前
@@ -170,8 +170,25 @@ class WVM_Upsampler(nn.Module):
         #)
 
         # Mamba 频域筛选
-        self.mamba_selector = VisualStateSpaceBlock(dim=self.mid_channels * 4)
+        #self.mamba_selector = VisualStateSpaceBlock(dim=self.mid_channels * 4)
         
+        # [修改] 移除 fusion_conv，改为分流处理
+        
+        # [分支 A] 低频语义 (LL) -> Mamba
+        # 只处理 1 个分量，参数量大幅降低
+        self.mamba_ll = VisualStateSpaceBlock(dim=self.mid_channels)
+
+        # [分支 B] 高频边缘 (LH, HL, HH) -> Strip DCN
+        # 处理 3 个分量，使用 1x7 和 7x1 并行卷积捕捉几何边缘
+        # 强制开启 use_dcn=True 以处理倾斜/不规则边缘
+        self.edge_align = StripConvBlock(
+            in_channels=self.mid_channels * 3,
+            out_channels=self.mid_channels * 3,
+            kernel_size=7,    
+            use_dcn=True      
+        )
+
+
         # 输出平滑
         self.out_conv = nn.Sequential(
             nn.Conv2d(self.mid_channels, out_channels, 3, padding=1),
@@ -189,16 +206,33 @@ class WVM_Upsampler(nn.Module):
         feat_hh = self.skip_proj(skip_hh)
         
         # 2. 筛选 (Selection)
-        combined = torch.cat([feat_ll, feat_lh, feat_hl, feat_hh], dim=1)
-        combined = self.fusion_conv(combined)
+        #combined = torch.cat([feat_ll, feat_lh, feat_hl, feat_hh], dim=1)
+        #combined = self.fusion_conv(combined)
 
         # 🔥🔥🔥 新增：先对齐，再筛选 🔥🔥🔥
         # Strip Conv 会利用 7x7 的视野，把语义和纹理在空间上对准
         # combined = self.align_module(combined)
 
-        combined_refined = self.mamba_selector(combined)
-        ref_ll, ref_lh, ref_hl, ref_hh = torch.chunk(combined_refined, 4, dim=1)
+        #combined_refined = self.mamba_selector(combined)
+        #ref_ll, ref_lh, ref_hl, ref_hh = torch.chunk(combined_refined, 4, dim=1)
         
+# ==================== [核心修改 Start] ====================
+        # 2. 分流处理 (Divide and Conquer)
+        
+        # Path A: 低频走 Mamba (学习全局语义)
+        ref_ll = self.mamba_ll(feat_ll)
+        
+        # Path B: 高频走 Strip DCN (学习几何边缘)
+        # 拼接三个高频分量
+        high_freq_stack = torch.cat([feat_lh, feat_hl, feat_hh], dim=1)
+        
+        # Strip DCN 处理
+        ref_high = self.edge_align(high_freq_stack)
+        
+        # 拆分回三个分量
+        ref_lh, ref_hl, ref_hh = torch.chunk(ref_high, 3, dim=1)
+        # ==================== [核心修改 End] ======================
+
         # 3. 重建 (Reconstruction)
         out = self.dwt_idwt.idwt(ref_ll, ref_lh, ref_hl, ref_hh)
         return self.out_conv(out)
