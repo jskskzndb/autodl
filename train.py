@@ -484,7 +484,7 @@ def get_args():
     parser.add_argument('--use-dubm', action='store_true', default=False, help='Enable D-UBM (SOTA)')
     parser.add_argument('--use-strg', action='store_true', default=False, help='Enable STRG Skip Enhancement')
     parser.add_argument('--use-dual-stream', action='store_true', default=False, help='Enable Dual-Stream Boundary Architecture')
-    
+    parser.add_argument('--use-wavelet-denoise', action='store_true', default=False, help='Enable Wavelet Denoising on Skip Connections')
     parser.add_argument('--use-dsis', action='store_true', default=False, help='Enable Dual-Stream Interactive Skip Module')
     parser.add_argument('--use-unet3p', action='store_true', default=False, help='Enable UNet 3+ Full-Scale Skip Connections')
     # [新增] MDBES-Net 相关参数
@@ -550,7 +550,7 @@ if __name__ == '__main__':
         use_dual_stream=args.use_dual_stream, # 🔥 新增双流
         use_dsis=args.use_dsis, # 🔥 传入参数
         use_unet3p=args.use_unet3p, # 🔥 传入参数
-        
+        use_wavelet_denoise=args.use_wavelet_denoise  # 👈 传入这个参数
           # 🔥 传入 MDBES-Net 解耦参数
     )
     

@@ -17,7 +17,7 @@
 # 特性：ResNet 编码器 + PHD 混合解码器
 #from .unet_model_phd import UNet
 
-#from .unet_model_unified import UNet 
+from .unet_model_unified import UNet 
 
 #纯净版phd模型
 #from .phd_unet import PHD_UNet as UNet
@@ -34,6 +34,6 @@
 # V2: 侧路增强版 (Standard ResUNet + WGN Skip)
 # from .unet_modelV2 import UNet
 
-from .wvm_unet import WVM_UNet as UNet
-
+#from .wvm_unet import WVM_UNet as UNet
+#from .wvm_unet_copy import WVM_UNet as UNet
 # from .unet_modelV3 import UNet

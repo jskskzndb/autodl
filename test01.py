@@ -101,7 +101,8 @@ def get_args():
     parser.add_argument('--use-wgn-enhancement', action='store_true', default=False)
     parser.add_argument('--use-cafm', action='store_true', default=False)
     parser.add_argument('--use-edge-loss', action='store_true', default=False)
-    
+    # 在 test01.py 的 get_args() 函数中添加：
+    parser.add_argument('--use-wavelet-denoise', action='store_true', default=False, help='Enable Wavelet Denoising on Skip Connections')
     # 🔥🔥🔥 [关键修改 1] 新增 DCN/D-UBM 开关 🔥🔥🔥
     parser.add_argument('--use-dcn', action='store_true', default=False, help='Enable DCNv3')
     parser.add_argument('--use-dubm', action='store_true', default=False, help='Enable D-UBM (SOTA)')
@@ -153,7 +154,8 @@ if __name__ == '__main__':
         use_dcn_in_phd=args.use_dcn,
         use_dsis=args.use_dsis,
         use_dubm=args.use_dubm,
-        use_dual_stream=args.use_dual_stream # 🔥 传入双流开关 
+        use_dual_stream=args.use_dual_stream,  # 🔥 传入双流开关
+        use_wavelet_denoise=args.use_wavelet_denoise
     )
 
     # 2. 加载权重

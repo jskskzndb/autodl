@@ -1,9 +1,9 @@
 """
-unet_model_unified.py (DSIS Skip-Channel Fix)
-修复说明：
-1. 修正了 up2 和 up3 初始化时的 skip_channels 参数，使其使用经过 DSIS 判断后的 skip_c2/skip_c1，
-   而不是原始的 c2/c1。解决了 'expected 512 channels, but got 320' 的报错。
-2. 完整保留了双流、STRG、CAFM 等逻辑。
+unet_model_unified.py (DSIS Skip-Channel Fix + Wavelet Denoising)
+修复与增强说明：
+1. [新增] 集成 NoiseCleaningSkipBlock (基于小波变换的跳跃连接去噪)。
+2. [保留] 修正了 DSIS 通道逻辑，解决了通道不匹配报错。
+3. [保留] 完整支持 UNet 3+、PHD Decoder、双流边界流等 SOTA 模块。
 """
 
 from .unet_parts import *
@@ -45,26 +45,127 @@ try: from .dsis_module import DSIS_Module
 except ImportError: DSIS_Module = None
 
 
+# ================================================================
+# 2. [新增] 小波变换与去噪模块
+# ================================================================
+
+class HaarWaveletTransform(nn.Module):
+    """ Haar 小波变换工具类 (无需训练) """
+    def __init__(self):
+        super().__init__()
+        pass
+
+    def dwt(self, x):
+        # x: [B, C, H, W]
+        x00 = x[:, :, 0::2, 0::2]
+        x01 = x[:, :, 0::2, 1::2]
+        x10 = x[:, :, 1::2, 0::2]
+        x11 = x[:, :, 1::2, 1::2]
+        
+        # Haar 分解公式
+        ll = (x00 + x01 + x10 + x11) / 2
+        lh = (x00 + x01 - x10 - x11) / 2
+        hl = (x00 - x01 + x10 - x11) / 2
+        hh = (x00 - x01 - x10 + x11) / 2
+        return ll, lh, hl, hh
+
+    def idwt(self, ll, lh, hl, hh):
+        # Haar 重构公式
+        x00 = (ll + lh + hl + hh) / 2
+        x01 = (ll + lh - hl - hh) / 2
+        x10 = (ll - lh + hl - hh) / 2
+        x11 = (ll - lh - hl + hh) / 2
+        
+        b, c, h, w = ll.shape
+        # 这里的 h, w 是下采样后的尺寸，输出应该是 2h, 2w
+        out = torch.zeros(b, c, h * 2, w * 2, device=ll.device, dtype=ll.dtype)
+        out[:, :, 0::2, 0::2] = x00
+        out[:, :, 0::2, 1::2] = x01
+        out[:, :, 1::2, 0::2] = x10
+        out[:, :, 1::2, 1::2] = x11
+        return out
+
+class NoiseCleaningSkipBlock(nn.Module):
+    """
+    [满血版] 基于小波变换的跳跃连接去噪模块
+    特性：
+    1. 不压缩通道 (mid = in_channels) -> 保留最大信息量
+    2. 使用标准卷积 (无 groups) -> 全通道交互，去噪更智能
+    """
+    def __init__(self, in_channels):
+        super().__init__()
+        self.dwt = HaarWaveletTransform()
+        
+        # 🔥 修改 1: 不省显存了，直接拉满
+        mid = in_channels 
+        
+        # A. 低频保护流
+        self.ll_enhance = nn.Sequential(
+            nn.Conv2d(in_channels, mid, 1),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, in_channels, 1), 
+            nn.Sigmoid() 
+        )
+        
+        # B. 高频去噪流
+        self.high_process = nn.Sequential(
+            # 第一步：先把 LH+HL+HH (3*C) 融合并降维到 C
+            nn.Conv2d(in_channels * 3, mid, 1), 
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+            
+            # 🔥 修改 2: 核心去噪层
+            # 删除了 groups 参数 -> 变成标准卷积
+            # 作用：利用周围像素 + 所有通道信息，共同判断哪里是噪点
+            nn.Conv2d(mid, in_channels * 3, 3, padding=1), 
+            
+            nn.Sigmoid() # 生成 0~1 的门控
+        )
+        
+        # 融合层
+        self.fusion = nn.Conv2d(in_channels * 4, in_channels, 1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        
+        # 1. 小波分解
+        ll, lh, hl, hh = self.dwt.dwt(x)
+        
+        # 2. 低频增强
+        ll_weight = self.ll_enhance(ll)
+        ll_clean = ll * (1 + ll_weight)
+        
+        # 3. 高频去噪
+        high_raw = torch.cat([lh, hl, hh], dim=1)
+        denoise_mask = self.high_process(high_raw) # 这一步现在是全通道感知的
+        high_clean = high_raw * denoise_mask 
+        
+        # 4. 重组
+        all_freqs = torch.cat([ll_clean, high_clean], dim=1)
+        out_small = self.fusion(all_freqs)
+        
+        out = F.interpolate(out_small, size=(H, W), mode='bilinear', align_corners=True)
+        
+        return x + out
+
+
+# ================================================================
+# 3. UNet 3+ 适配器
+# ================================================================
 class Up_PHD_3Plus(nn.Module):
     """
     ConvNeXt + UNet 3+ + PHD 完美结合版
-    流程: 
-    1. Aggregator: 收集 [s1,s2,s3,x4] + prev_dec -> 统一拼接 (320ch)
-    2. PHD Block: 对 320ch 特征进行 Mamba/DCN 精修
     """
     def __init__(self, current_level, total_levels, enc_ch_list, prev_dec_ch, 
                  out_channels, use_dcn=False, use_dubm=False):
         super().__init__()
         
-        # 1. 聚合器 (UNet 3+ 核心)
-        # 假设 4层Encoder + 1层Decoder，拼接后通道数 = 5 * 64 = 320
         cat_channels = 64
         self.aggregator = UNet3P_Aggregator(current_level, total_levels, enc_ch_list, prev_dec_ch, cat_channels)
         
-        agg_channels = (len(enc_ch_list) + 1) * cat_channels # 320
+        agg_channels = (len(enc_ch_list) + 1) * cat_channels 
         
-        # 2. PHD 解码器 (处理聚合后的特征)
-        # 注意: PHD Block 的输入是 agg_channels (320)，输出是 out_channels
         self.phd_block = PHD_DecoderBlock(in_channels=agg_channels, out_channels=out_channels, 
                                           use_dcn=use_dcn, use_dubm=use_dubm)
 
@@ -73,12 +174,13 @@ class Up_PHD_3Plus(nn.Module):
         x_agg = self.aggregator(prev_dec_feat, enc_feats_list)
         
         # Step 2: PHD 精修
-        # PHD Block 期望接收 (x, edge_prior)。我们将 x_agg 视为输入 x
         x_out = self.phd_block(x_agg, edge_prior=edge_prior)
         
         return x_out
+
+
 # ================================================================
-# 2. 适配器：Up_PHD
+# 4. 标准/PHD 适配器
 # ================================================================
 class Up_PHD(nn.Module):
     def __init__(self, in_channels, out_channels, bilinear=True, skip_channels=0, 
@@ -120,15 +222,15 @@ class Up_PHD(nn.Module):
 
 
 # ================================================================
-# 3. 统一主模型 UNet
+# 5. 统一主模型 UNet
 # ================================================================
 class UNet(nn.Module):
     def __init__(self, n_channels, n_classes, bilinear=True, 
                  encoder_name='resnet', decoder_name='phd', cnext_type='convnextv2_tiny', 
                  use_wgn_enhancement=False, use_cafm=False, use_edge_loss=False, wgn_orders=None,
                  use_dcn_in_phd=False, use_dsis=False, use_dubm=False, use_strg=False,
-                 use_dual_stream=False,
-                 use_unet3p=False):
+                 use_dual_stream=False, use_unet3p=False, 
+                 use_wavelet_denoise=False): # 🔥 [新增参数] 开启小波去噪
         
         super(UNet, self).__init__()
         self.n_channels = n_channels
@@ -141,8 +243,9 @@ class UNet(nn.Module):
         self.use_dsis = use_dsis and (DSIS_Module is not None)
         self.use_cafm = use_cafm and (CAFM is not None)
         self.use_dual_stream = use_dual_stream and (BoundaryStream is not None)
-        self.use_unet3p = use_unet3p  # 🔥🔥🔥 加上这一行！
-        self.use_dsis = use_dsis and (DSIS_Module is not None)
+        self.use_unet3p = use_unet3p
+        self.use_wavelet_denoise = use_wavelet_denoise # 🔥 保存开关
+
         # --------------------------------------------------------
         # A. Encoder 初始化
         # --------------------------------------------------------
@@ -200,14 +303,21 @@ class UNet(nn.Module):
             self.cafm4 = CAFM(c4)
         
         # --------------------------------------------------------
-        # D. DSIS 初始化 (设置 skip_c1 和 skip_c2)
+        # [新增] D. 小波去噪模块初始化 (NoiseCleaningSkipBlock)
+        # --------------------------------------------------------
+        if self.use_wavelet_denoise:
+            print("   🌊 [Wavelet] Enabling Skip-Connection Denoising...")
+            self.skip_clean1 = NoiseCleaningSkipBlock(c1)
+            self.skip_clean2 = NoiseCleaningSkipBlock(c2)
+            self.skip_clean3 = NoiseCleaningSkipBlock(c3)
+
+        # --------------------------------------------------------
+        # E. DSIS 初始化
         # --------------------------------------------------------
         if self.use_dsis:
             print("   🔗 Applying DSIS (Dual-Stream Interactive Skip)...")
-            dsis_channels = 64 # DSIS 输出固定为 64 通道
+            dsis_channels = 64
             self.dsis_module = DSIS_Module(c1_in=c1, c2_in=c2, c_base=dsis_channels)
-            
-            # 🔥 这里的计算逻辑是正确的
             skip_c1 = dsis_channels
             skip_c2 = dsis_channels
         else:
@@ -215,44 +325,36 @@ class UNet(nn.Module):
             skip_c2 = c2
 
         # --------------------------------------------------------
-        # E. 双流架构：边界流初始化
+        # F. 双流架构：边界流初始化
         # --------------------------------------------------------
         if self.use_dual_stream:
             print("   🌊 [Dual-Stream] Initializing Boundary Stream (Explicit Edge)...")
             self.boundary_stream = BoundaryStream(in_channels=c1)
 
         # --------------------------------------------------------
-        # F. Decoder 初始化
+        # G. Decoder 初始化
         # --------------------------------------------------------
         if self.use_unet3p:
             print("   🌟 [Architecture] Enabled UNet 3+ Full-Scale Skip Connections (Perfect Mode)")
-            # UNet 3+ Mode
-            # Encoder List: [s1, s2, s3, x4] -> 对应 Channel [c1, c2, c3, c4]
+            # Encoder List: [s1, s2, s3, x4] -> [c1, c2, c3, c4]
             enc_ch_list = [c1, c2, c3, c4]
             total_levels = 4
             
-            # --- Decoder Node 1 (对应 s3 分辨率, Level 2) ---
-            # Input: Prev_Decoder(x4/c4), All Encoders
-            # Output channels: 随意定义，通常还是保持 c3 或减半。PHD 内部会降维。
-            # 这里我们设定输出为 c3 (384 for tiny)，方便后续传递
+            # Decoder 1 (Level 2) -> Output c3
             self.up1 = Up_PHD_3Plus(current_level=2, total_levels=4, enc_ch_list=enc_ch_list, 
                                     prev_dec_ch=c4, out_channels=c3, 
                                     use_dcn=use_dcn_in_phd, use_dubm=use_dubm)
                                     
-            # --- Decoder Node 2 (对应 s2 分辨率, Level 1) ---
-            # Input: Prev_Decoder(up1 output, c3), All Encoders
+            # Decoder 2 (Level 1) -> Output c2
             self.up2 = Up_PHD_3Plus(current_level=1, total_levels=4, enc_ch_list=enc_ch_list, 
                                     prev_dec_ch=c3, out_channels=c2, 
                                     use_dcn=use_dcn_in_phd, use_dubm=use_dubm)
                                     
-            # --- Decoder Node 3 (对应 s1 分辨率, Level 0) ---
-            # Input: Prev_Decoder(up2 output, c2), All Encoders
+            # Decoder 3 (Level 0) -> Output c1
             self.up3 = Up_PHD_3Plus(current_level=0, total_levels=4, enc_ch_list=enc_ch_list, 
                                     prev_dec_ch=c2, out_channels=c1, 
                                     use_dcn=use_dcn_in_phd, use_dubm=use_dubm)
                                     
-            # UNet 3+ 最终输出的是 c1 通道 (s1 尺寸)，需要再上采样一次回原图
-            # 同样使用 DoubleConv 整理
             if bilinear:
                 self.up4 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True), DoubleConv(c1, 64))
             else:
@@ -262,21 +364,14 @@ class UNet(nn.Module):
             UpBlock = Up_PHD if decoder_name == 'phd' else Up
         
             if decoder_name == 'phd':
-            # Up1 接收 s3 (c3)，DSIS 不处理 c3，所以 skip 仍为 c3
                 self.up1 = UpBlock(c4, c3, bilinear, skip_channels=c3, use_dcn=use_dcn_in_phd, use_dubm=use_dubm, use_strg=use_strg)
-            
-            # 🔥🔥🔥 [关键修复]：这里必须用 skip_c2，而不是 c2
                 self.up2 = UpBlock(c3, c2, bilinear, skip_channels=skip_c2, use_dcn=use_dcn_in_phd, use_dubm=use_dubm, use_strg=use_strg)
-            
-            # 🔥🔥🔥 [关键修复]：这里必须用 skip_c1，而不是 c1
                 self.up3 = UpBlock(c2, c1, bilinear, skip_channels=skip_c1, use_dcn=use_dcn_in_phd, use_dubm=use_dubm, use_strg=use_strg)
             else:
                 self.up1 = UpBlock(c4, c3, bilinear, skip_channels=c3)
-            # 这里的标准 Decoder 最好也适配一下，虽然你现在主要用 PHD
                 self.up2 = UpBlock(c3, c2, bilinear, skip_channels=skip_c2)
                 self.up3 = UpBlock(c2, c1, bilinear, skip_channels=skip_c1)
 
-        # 最后一层
             if bilinear:
                 self.up4 = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True), DoubleConv(c1, 64))
             else:
@@ -303,48 +398,44 @@ class UNet(nn.Module):
             s3 = self.down3(s2)
             x4 = self.down4(s3)
 
-        # 2. CAFM
+        # 2. CAFM (可选增强)
         if self.use_cafm:
             s1 = self.cafm1(s1)
             s2 = self.cafm2(s2)
             s3 = self.cafm3(s3)
             x4 = self.cafm4(x4)
 
-        # 3. DSIS (注意：DSIS 和 UNet3+ 通道逻辑可能冲突，UNet3+ 时建议关闭 DSIS)
+        # 🔥 [新增步骤] 3. 小波去噪 (Wavelet Denoising)
+        # 放在 CAFM 之后，DSIS 之前，清洗特征
+        if self.use_wavelet_denoise:
+            s1 = self.skip_clean1(s1)
+            s2 = self.skip_clean2(s2)
+            s3 = self.skip_clean3(s3)
+
+        # 4. DSIS (可选混合)
         if self.use_dsis:
             s1, s2 = self.dsis_module(s1, s2)
 
-        # 4. 双流
+        # 5. 双流边界流 (可选)
         boundary_logits = None
         edge_prior = None
         if self.use_dual_stream:
             boundary_logits = self.boundary_stream(s1)
             edge_prior = boundary_logits.detach()
 
-        # 5. Decoder (核心修复点：增加分支判断)
+        # 6. Decoder (PHD / UNet 3+ / Standard)
         if self.use_unet3p:
-            # === 🔥 UNet 3+ 专用路径 (全尺度聚合) ===
-            # 将所有特征打包成列表: [Scale0(s1), Scale1(s2), Scale2(s3), Scale3(x4)]
             enc_list = [s1, s2, s3, x4]
-            
-            # Decoder 1: 恢复到 s3 尺度
             d1 = self.up1(prev_dec_feat=x4, enc_feats_list=enc_list, edge_prior=edge_prior)
-            
-            # Decoder 2: 恢复到 s2 尺度
             d2 = self.up2(prev_dec_feat=d1, enc_feats_list=enc_list, edge_prior=edge_prior)
-            
-            # Decoder 3: 恢复到 s1 尺度
             d3 = self.up3(prev_dec_feat=d2, enc_feats_list=enc_list, edge_prior=edge_prior)
             
-            # Final Up
             d4 = self.up4(d3)
             d5 = self.final_up(d4)
             logits = self.outc(d5)
             
         else:
-            # === 普通路径 (级联解码) ===
             if self.decoder_name == 'phd':
-                # 注意：如果 use_dual_stream 是 False，boundary_logits 就是 None
                 d1 = self.up1(x4, s3, edge_prior=boundary_logits)
                 d2 = self.up2(d1, s2, edge_prior=boundary_logits)
                 d3 = self.up3(d2, s1, edge_prior=boundary_logits)
@@ -357,10 +448,8 @@ class UNet(nn.Module):
             d5 = self.final_up(d4)
             logits = self.outc(d5)
 
-        # 6. 返回逻辑
+        # 7. 返回结果
         if self.training and self.use_dual_stream:
             return logits, boundary_logits
         else:
             return logits
-
-      
