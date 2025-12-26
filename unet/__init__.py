@@ -17,7 +17,7 @@
 # 特性：ResNet 编码器 + PHD 混合解码器
 #from .unet_model_phd import UNet
 
-from .unet_model_unified import UNet 
+#from .unet_model_unified import UNet 
 
 #纯净版phd模型
 #from .phd_unet import PHD_UNet as UNet
@@ -37,3 +37,5 @@ from .unet_model_unified import UNet
 #from .wvm_unet import WVM_UNet as UNet
 #from .wvm_unet_copy import WVM_UNet as UNet
 # from .unet_modelV3 import UNet
+# 🔥 新的导入：指向 S-DMFNet
+from .unet_s_dmfnet import S_DMFNet as UNet

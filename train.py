@@ -15,7 +15,9 @@ import wandb
 from evaluate import evaluate, threshold_scan_evaluate
 from utils.data_loading import BasicDataset
 from utils.dice_score import dice_loss
-from utils.losses import FocalLoss, CombinedLoss, DiceLossOnly
+
+
+from utils.losses import FocalLoss, CombinedLoss, DiceLossOnly, EdgeLoss
 from utils.utils import log_grad_stats
 
 from unet import UNet
@@ -233,7 +235,8 @@ def train_model(
         elif loss_combination == 'dice': criterion = DiceLossOnly()
         else: criterion = CombinedLoss(loss_parts, weights, focal_alpha, focal_gamma)
         logging.info(f'✅ Using Loss: {loss_combination}')
-
+    # 🔥 [新增] 初始化 EdgeLoss (必须放在这里)
+    edge_criterion = EdgeLoss(device=device)
     global_step = 0
 
     # 恢复 Checkpoint
@@ -306,6 +309,11 @@ def train_model(
                         # === [模式 B] 普通 Baseline 模式 (1个输出) ===
                         masks_pred = output
                         loss = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
+                        # 🔥 [新增] 计算并叠加 Edge Loss
+                        # 只有当 lambda_edge > 0 时才计算
+                        if lambda_edge > 0:
+                            loss_e = edge_criterion(masks_pred, true_masks)
+                            loss += lambda_edge * loss_e
                 # 异常检测
                 if torch.isnan(loss) or torch.isinf(loss):
                     logging.error(f'Loss NaN/Inf detected: {loss.item()}. Skipping batch.')
