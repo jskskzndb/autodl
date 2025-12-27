@@ -268,58 +268,72 @@ def train_model(
                 with torch.cuda.amp.autocast(enabled=amp):
                     output = model(images)
                     
-                    # -----------------------------------------------------------
-                    # 🔥 新版逻辑：只支持 3输出 (MDBES) 或 1输出 (Baseline)
+                   # -----------------------------------------------------------
+                    # 🔥 修复后的逻辑：自适应处理 2输出 或 3输出
                     # -----------------------------------------------------------
                     if isinstance(output, tuple):
-                        # === [模式 A] MDBES-Net 解耦模式 (Seg, Body, Edge) ===
-                        # 只要是 tuple，就默认一定是 3 个输出
-                        masks_pred, body_pred, edge_pred = output
-                        
-                        # 1. 准备真值 (GT)
-                        true_edges = generate_edge_tensor(true_masks) 
-                        
-                        # Body GT = Mask - Edge (利用广播机制)
-                        true_masks_float = true_masks.unsqueeze(1).float()
-                        true_body = true_masks_float - true_edges
-                        true_body = torch.clamp(true_body, 0, 1)
+                        # 1. 准备边缘真值 (所有双流模式都需要)
+                        true_edges = generate_edge_tensor(true_masks)
 
-                        # 2. 尺寸对齐 (防止预测图和真值尺寸不一致)
-                        if edge_pred.shape[2:] != true_edges.shape[2:]:
-                            edge_pred = F.interpolate(edge_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
-                            body_pred = F.interpolate(body_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
+                        if len(output) == 3:
+                            # === [模式 A] MDBES-Net (Seg, Body, Edge) ===
+                            masks_pred, body_pred, edge_pred = output
+                            
+                            # Body GT 计算
+                            true_masks_float = true_masks.unsqueeze(1).float()
+                            true_body = torch.clamp(true_masks_float - true_edges, 0, 1)
 
-                        # 3. 计算 Loss (三合一)
-                        
-                        # (1) 主分割 Loss
-                        l_seg = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
-                        
-                        # (2) 主体 Loss (BCE)
-                        l_body = F.binary_cross_entropy_with_logits(body_pred, true_body)
-                        
-                        # (3) 边缘 Loss (BCE + 权重)
-                        l_edge = F.binary_cross_entropy_with_logits(
-                            edge_pred, true_edges, pos_weight=torch.tensor([5.0], device=device)
-                        )
-                        
-                        # 4. 总 Loss 加权 (使用传入的 lambda 参数)
-                        loss = l_seg + (lambda_body * l_body) + (lambda_edge * l_edge)
+                            # 尺寸对齐
+                            if edge_pred.shape[2:] != true_edges.shape[2:]:
+                                edge_pred = F.interpolate(edge_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
+                                body_pred = F.interpolate(body_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
+
+                            # Loss 计算
+                            l_seg = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
+                            l_body = F.binary_cross_entropy_with_logits(body_pred, true_body)
+                            l_edge = F.binary_cross_entropy_with_logits(edge_pred, true_edges, pos_weight=torch.tensor([5.0], device=device))
+                            
+                            loss = l_seg + (lambda_body * l_body) + (lambda_edge * l_edge)
+
+                        elif len(output) == 2:
+                            # === [模式 B] S-DMFNet (Seg, Aux_Edge) ===
+                            # 🔥 这是你现在需要的逻辑
+                            masks_pred, edge_pred = output
+                            
+                            # 尺寸对齐
+                            if edge_pred.shape[2:] != true_edges.shape[2:]:
+                                edge_pred = F.interpolate(edge_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
+                            
+                            # Loss 计算
+                            # 1. 主分割 Loss (BCE/Dice/Focal)
+                            l_seg = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
+                            
+                            # 2. 辅助边缘 Loss (BCE With Logits)
+                            # 使用辅助头预测的 edge_pred 和生成的 true_edges 进行比较
+                            # pos_weight=5.0 是为了解决边缘像素过少的不平衡问题
+                            l_edge = F.binary_cross_entropy_with_logits(
+                                edge_pred, true_edges, pos_weight=torch.tensor([5.0], device=device)
+                            )
+                            
+                            # 3. 总 Loss
+                            loss = l_seg + (lambda_edge * l_edge)
 
                     else:
-                        # === [模式 B] 普通 Baseline 模式 (1个输出) ===
+                        # === [模式 C] 单输出模式 (Seg only) ===
                         masks_pred = output
                         loss = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
-                        # 🔥 [新增] 计算并叠加 Edge Loss
-                        # 只有当 lambda_edge > 0 时才计算
+                        
+                        # 🔥 隐式边缘监督 (Gradient-based Edge Loss)
+                        # 如果没有辅助头，就强迫主分割图的梯度要锐利
                         if lambda_edge > 0:
                             loss_e = edge_criterion(masks_pred, true_masks)
                             loss += lambda_edge * loss_e
+
                 # 异常检测
                 if torch.isnan(loss) or torch.isinf(loss):
                     logging.error(f'Loss NaN/Inf detected: {loss.item()}. Skipping batch.')
                     optimizer.zero_grad()
                     continue
-
                 # 反向传播
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
@@ -351,15 +365,20 @@ def train_model(
         val_metrics = evaluate(model, val_loader, device, amp, criterion=criterion)
         
         
-        # 2. 阈值扫描
-        logging.info('Starting threshold scanning...')
-        threshold_res = threshold_scan_evaluate(model, val_loader, device, amp, (0.3, 0.8), 0.01)
+        # 2. 🔥 [关键修改] 禁用阈值扫描，直接复用 0.5 阈值的结果
+        # logging.info('Starting threshold scanning...')
+        # threshold_res = threshold_scan_evaluate(...) # <--- 注释掉这一行
         
-        logging.info(f'Threshold scan completed - Best Dice: {threshold_res["best_dice"]:.4f} '
-                     f'at threshold {threshold_res["best_threshold_dice"]:.2f}, '
-                     f'Best F1: {threshold_res["best_f1"]:.4f} '
-                     f'at threshold {threshold_res["best_threshold_f1"]:.2f}')
+        # 🔥 手动构造结果字典，保持变量名兼容，防止后面报错
+        threshold_res = {
+            'best_dice': val_metrics['dice'],      # 直接用 0.5 的 Dice
+            'best_f1': val_metrics['f1'],          # 直接用 0.5 的 F1
+            'best_threshold_dice': 0.5,            # 固定显示 0.5
+            'best_threshold_f1': 0.5               # 固定显示 0.5
+        }
         
+        logging.info('⏩ Skipping threshold scan. Using fixed threshold 0.5.')
+
         scheduler.step()
         
         # 4. 详细控制台输出
@@ -413,7 +432,12 @@ def train_model(
             
             # Latest
             torch.save(checkpoint, str(dir_checkpoint / 'checkpoint_latest.pth'))
-            
+            # 2. 🔥 [修改点 2] 30轮以后，每一轮都额外保存一个文件
+            if epoch > 30:
+                # 文件名例如: checkpoint_epoch_31.pth, checkpoint_epoch_32.pth ...
+                epoch_path = str(dir_checkpoint / f'checkpoint_epoch_{epoch}.pth')
+                torch.save(checkpoint, epoch_path)
+                logging.info(f'💾 [备份] 已保存第 {epoch} 轮权重: {epoch_path}')
             # Best
             best_path = str(dir_checkpoint / 'checkpoint_best.pth')
             current_dice = val_metrics['dice']
@@ -573,6 +597,10 @@ if __name__ == '__main__':
             if 'model_state_dict' in ckpt:
                 model.load_state_dict(ckpt['model_state_dict'])
                 checkpoint_to_load = ckpt
+                # 🔥🔥🔥 [新增] 自动读取断点轮数，实现无缝续训 🔥🔥🔥
+                if 'epoch' in ckpt:
+                    args.start_epoch = ckpt['epoch'] + 1
+                    logging.info(f"🔄 自动检测到断点 (Epoch {ckpt['epoch']})，将从 Epoch {args.start_epoch} 继续训练！")
             else:
                 model.load_state_dict(ckpt)
             logging.info(f'Model loaded from {args.load}')

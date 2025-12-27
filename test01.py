@@ -37,8 +37,12 @@ def test_model(
                 images = images.to(device, dtype=torch.float32, memory_format=torch.channels_last)
                 true_masks = true_masks.to(device, dtype=torch.long)
 
-                # 🔥 兼容多输出 (训练时 D-UBM 可能返回 tuple，测试时只取第一个 logits)
+                # 🔥 推理
                 output = net(images)
+                
+                # 🔥 [兼容性处理]
+                # S-DMFNet 在 eval 模式下通常只返回 logits (Tensor)
+                # 但为了防止某些变体返回 (logits, edge_logits)，这里保留兼容逻辑
                 if isinstance(output, tuple):
                     masks_pred = output[0]
                 else:
@@ -93,7 +97,7 @@ def get_args():
     # 架构参数 (必须与训练时一致)
     parser.add_argument('--encoder', type=str, default='resnet', choices=['resnet', 'cnextv2', 'standard'])
     parser.add_argument('--decoder', type=str, default='phd', choices=['phd', 'standard'])
-    parser.add_argument('--cnext-type', type=str, default='convnextv2_tiny')
+    parser.add_argument('--cnext-type', type=str, default='convnextv2_base')
     parser.add_argument('--bilinear', action='store_true', default=False)
     parser.add_argument('--classes', '-c', type=int, default=1)
     
@@ -109,6 +113,8 @@ def get_args():
     parser.add_argument('--use-strg', action='store_true', default=False)
     parser.add_argument('--use-dual-stream', action='store_true', default=False) # 🔥 修复报错的关键
     parser.add_argument('--use-dsis', action='store_true', default=False, help='Enable Dual-Stream Interactive Skip Module')
+    
+    parser.add_argument('--use-unet3p', action='store_true', default=False, help='Enable UNet 3+ logic')
     # WGN 参数
     parser.add_argument('--wgn-base-order', type=int, default=3)
     parser.add_argument('--wgn-orders', type=str, default=None)
@@ -154,7 +160,9 @@ if __name__ == '__main__':
         use_dcn_in_phd=args.use_dcn,
         use_dsis=args.use_dsis,
         use_dubm=args.use_dubm,
+        use_strg=args.use_strg,            # 补上
         use_dual_stream=args.use_dual_stream,  # 🔥 传入双流开关
+        use_unet3p=args.use_unet3p,        # 补上
         use_wavelet_denoise=args.use_wavelet_denoise
     )
 
