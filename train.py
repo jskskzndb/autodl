@@ -25,6 +25,17 @@ from unet import UNet
 
 import random
 
+def setup_seed(seed):
+    import random
+    import numpy as np
+    
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True  # 保证算法结果确定
+    # torch.backends.cudnn.benchmark = False   # 建议注释掉。设为False会变慢，通常不值得
+
 def log_best_visuals(model, val_loader, device, num_samples=5):
     """
     将 原图、预测掩码、真值掩码 并排展示在 WandB 表格中。
@@ -635,6 +646,9 @@ def get_args():
     return parser.parse_args()
 
 if __name__ == '__main__':
+    # 🔥🔥🔥 在这里调用，数字随便填（比如 42, 3407, 2023）
+    setup_seed(42)
+    
     args = get_args()
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
