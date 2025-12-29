@@ -28,16 +28,24 @@ class MambaLayer2D(nn.Module):
     def forward(self, x):
         # x 的形状是图片格式: [Batch, Channel, Height, Width]
         B, C, H, W = x.shape
+        # 🔥 开启防爆盾：强制 FP32
+        with torch.cuda.amp.autocast(enabled=False):
+            
+            # 1. 进门先转 FP32
+            x = x.float()
+
+            # 2. 变形 (FP32)
+            x_seq = x.flatten(2).transpose(1, 2) 
+            
+            # 3. 归一化 + Mamba 处理 (FP32) <--- 这里是重点！
+            x_seq = self.norm(x_seq)
+            x_seq = self.mamba(x_seq) 
+            
+            # 4. 变回图片 (FP32)
+            x_out = x_seq.transpose(1, 2).view(B, C, H, W)
         
-        # --- 变形 (这是你需要写的核心逻辑) ---
-        # 1. 把 (B, C, H, W) 变成 (B, L, C)，因为 Mamba 只吃序列
-        x_seq = x.flatten(2).transpose(1, 2) 
-        
-        # 2. 归一化 + Mamba处理
-        x_seq = self.norm(x_seq)
-        x_seq = self.mamba(x_seq) # <--- 这一步调用官方库，速度飞快
-        
-        # 3. 变回图片 (B, C, H, W)
-        x_out = x_seq.transpose(1, 2).view(B, C, H, W)
+        # 出了缩进再 return
+        return x_out
+         
         
         return x_out

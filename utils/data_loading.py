@@ -69,20 +69,11 @@ class BasicDataset(Dataset):
                 # 随机在原图上挖掉正方形黑洞，但【不挖 Mask】
                 # 强迫模型通过 Mamba 的长距离扫描能力，结合上下文推断被遮挡的部分
                 # 适配 Albumentations 2.x 版本
-                A.CoarseDropout(
-                    num_holes_range=(1, 8),       # 对应原来的 min_holes, max_holes
-                    hole_height_range=(10, 32),   # 对应原来的 max_height (设个下限防止洞太小)
-                    hole_width_range=(10, 32),    # 对应原来的 max_width
-                    fill_value=0,                 # 填黑色
-                    mask_fill_value=None,         # Mask不挖
-                    p=0.3
-            ),
+                
             ])
         # ============================================================
 
-    def __len__(self):
-        return len(self.ids)
-        logging.info(f'Unique mask values: {self.mask_values}')
+    
 
     def __len__(self):
         return len(self.ids)
