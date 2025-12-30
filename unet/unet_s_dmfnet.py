@@ -67,32 +67,41 @@ class HaarWaveletTransform(nn.Module):
 # ================================================================
 
 class WaveletMambaBlock(nn.Module):
-    """ 右路：小波-Mamba 编码器块 """
+    """ 
+    [Modified] High-Frequency Aware Mamba
+    动机：利用 Mamba 的长序列能力，修复高频分量中不连续的建筑物边缘
+    """
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.dwt = HaarWaveletTransform()
         
-        # LL (低频): Mamba 捕捉全局结构
+        # 1. Low Freq (LL): 使用普通卷积捕捉粗略结构
         self.low_process = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 1),
-            nn.BatchNorm2d(out_channels),
-            MambaLayer2D(dim=out_channels) if MambaLayer2D else nn.Identity()
-        )
-        
-        # High (高频): Conv 捕捉局部边缘
-        self.high_process = nn.Sequential(
-            nn.Conv2d(in_channels * 3, out_channels, 3, padding=1),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
-        # 融合
+        
+        # 2. High Freq (LH+HL+HH): 使用 Mamba 进行全局边缘连通性建模
+        # 输入维度是 in_channels * 3
+        self.high_process = nn.Sequential(
+            nn.Conv2d(in_channels * 3, out_channels, 1), # 降维对齐
+            nn.BatchNorm2d(out_channels),
+            # 🔥 Mamba 放这里！处理高频边缘
+            MambaLayer2D(dim=out_channels) if MambaLayer2D else nn.Identity() 
+        )
+        
+        # 3. 融合
         self.fusion = nn.Conv2d(out_channels * 2, out_channels, 1)
 
     def forward(self, x):
         ll, lh, hl, hh = self.dwt.dwt(x)
+        # 低频走 CNN
         ll_feat = self.low_process(ll)
+        # 高频堆叠走 Mamba
         high_cat = torch.cat([lh, hl, hh], dim=1)
         high_feat = self.high_process(high_cat)
+        # 融合
         out = self.fusion(torch.cat([ll_feat, high_feat], dim=1))
         return out
 
@@ -101,50 +110,96 @@ class WaveletMambaBlock(nn.Module):
 #    学术对标: RSBuilding (2024)
 # ================================================================
 
-class Bi_FGF_Module(nn.Module):
-    """ 
-    Bi-Directional Frequency-Guided Fusion 
-    双向互导频率融合模块
+class Cross_GL_FGF(nn.Module):
     """
-    def __init__(self, s_channels, f_channels):
+    [SOTA级交互] Cross Global-Local Frequency-Guided Fusion
+    论文图示：X-Structure (Serial)
+    逻辑：Global Channel Gating (Denoise) -> Local Spatial Gating (Align) -> Injection (Fusion)
+    """
+    def __init__(self, s_channels, f_channels, reduction=16):
         super().__init__()
         
-        # --- Path 1: Freq -> Spatial (频率清洗语义) ---
-        # 利用边缘信息 (Freq) 生成 Attention，去除 Spatial 中的平坦背景噪声
-        self.freq_gate = nn.Sequential(
-            nn.Conv2d(f_channels, 1, kernel_size=1),
-            nn.BatchNorm2d(1),
-            nn.Sigmoid()
-        )
-        # 频率特征注入对齐
-        self.freq_align = nn.Conv2d(f_channels, s_channels, kernel_size=1)
+        # 安全计算隐藏层维度
+        s_mid = max(s_channels // reduction, 4)
+        f_mid = max(f_channels // reduction, 4)
 
-        # --- Path 2: Spatial -> Freq (语义抑制频率) ---
-        # 利用语义置信度 (Spatial) 生成 Attention，去除 Freq 中的虚假纹理(如波纹)
-        self.spatial_gate = nn.Sequential(
-            nn.Conv2d(s_channels, 1, kernel_size=1),
+        # --- Stage 1: Global Channel Interaction (宏观去噪) ---
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        
+        # S -> F (语义指导频率：去噪)
+        self.mlp_s2f = nn.Sequential(
+            nn.Linear(s_channels, f_mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(f_mid, f_channels, bias=False),
+            nn.Sigmoid()
+        )
+        # F -> S (频率指导语义：关注细节)
+        self.mlp_f2s = nn.Sequential(
+            nn.Linear(f_channels, s_mid, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(s_mid, s_channels, bias=False),
+            nn.Sigmoid()
+        )
+
+        # --- Stage 2: Local Spatial Interaction (微观精修) ---
+        self.spatial_conv_s2f = nn.Sequential(
+            nn.Conv2d(s_channels, 1, kernel_size=7, padding=3, bias=False),
             nn.BatchNorm2d(1),
             nn.Sigmoid()
         )
-        # 语义特征注入对齐
-        self.spatial_align = nn.Conv2d(s_channels, f_channels, kernel_size=1)
+        self.spatial_conv_f2s = nn.Sequential(
+            nn.Conv2d(f_channels, 1, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+
+        # --- Stage 3: Feature Injection (特征融合) ---
+        self.s_align = nn.Conv2d(s_channels, f_channels, 1)
+        self.f_align = nn.Conv2d(f_channels, s_channels, 1)
+        
+        # Zero-Init: 保证训练初期互不干扰
+        nn.init.constant_(self.s_align.weight, 0)
+        nn.init.constant_(self.s_align.bias, 0)
+        nn.init.constant_(self.f_align.weight, 0)
+        nn.init.constant_(self.f_align.bias, 0)
+        
+        # 最终融合卷积 (Concatenate -> Conv)
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(s_channels * 2, s_channels, 1),
+            nn.BatchNorm2d(s_channels),
+            nn.ReLU(inplace=True)
+        )
 
     def forward(self, x_s, x_f):
-        # 如果尺寸不匹配(通常不会发生，但为了鲁棒性)
+        B, Cs, H, W = x_s.shape
+        _, Cf, _, _ = x_f.shape
+        
+        # 尺寸对齐
         if x_f.shape[2:] != x_s.shape[2:]:
-            x_f = F.interpolate(x_f, size=x_s.shape[2:], mode='bilinear', align_corners=False)
+            x_f = F.interpolate(x_f, size=(H, W), mode='bilinear', align_corners=False)
 
-        # 1. 正向引导 (Freq -> Spatial)
-        # 逻辑: 语义特征 * 边缘权重 + 频率细节补充
-        att_map_f2s = self.freq_gate(x_f)
-        s_out = (x_s * att_map_f2s) + self.freq_align(x_f)
+        # 1. 全局去噪 (Channel Gating)
+        s_vec = self.gap(x_s).view(B, Cs)
+        f_vec = self.gap(x_f).view(B, Cf)
+        w_s2f = self.mlp_s2f(s_vec).view(B, Cf, 1, 1) 
+        w_f2s = self.mlp_f2s(f_vec).view(B, Cs, 1, 1) 
+        f_clean = x_f * w_s2f
+        s_clean = x_s * w_f2s
+        
+        # 2. 局部精修 (Spatial Attention)
+        m_s2f = self.spatial_conv_s2f(s_clean) 
+        m_f2s = self.spatial_conv_f2s(f_clean)
+        f_refined = f_clean * m_s2f + f_clean
+        s_refined = s_clean * m_f2s + s_clean
 
-        # 2. 反向引导 (Spatial -> Freq)
-        # 逻辑: 频率特征 * 语义权重 + 语义上下文补充
-        att_map_s2f = self.spatial_gate(x_s)
-        f_out = (x_f * att_map_s2f) + self.spatial_align(x_s)
-
-        return s_out, f_out
+        # 3. 交叉融合 (Fusion for Skip)
+        # 将 F 对齐并注入
+        f_injected = self.f_align(f_refined)
+        # 拼接 + 卷积融合 (生成跳跃连接特征)
+        out = self.fusion_conv(torch.cat([s_refined, f_injected], dim=1))
+        
+        # 返回: (跳跃连接特征, 增强后的频率特征)
+        return out, f_refined
 # ================================================================
 # 🔥 [新增] SK-Fusion: 涨点神器
 # ================================================================
@@ -227,7 +282,7 @@ class Up_PHD(nn.Module):
         return self.conv(x, edge_prior=edge_prior)
 
 # ================================================================
-# 5. S_DMFNet 主模型 (Bi-FGF 版)
+# 5. S_DMFNet 主模型 (Refined)
 # ================================================================
 
 class S_DMFNet(nn.Module):
@@ -244,8 +299,8 @@ class S_DMFNet(nn.Module):
         self.n_classes = n_classes
         self.bilinear = bilinear
         
-        print(f"🚀 [S-DMFNet Pro] 初始化... Encoder: {cnext_type}, Decoder: {decoder_name}")
-        print(f"   ✨ Features: Bi-FGF (Enabled), MFAM (Removed), EdgeHead (Enhanced)")
+        print(f"🚀 [S-DMFNet Pro] Rebuttal Version | Encoder: {cnext_type}")
+        print(f"   ✨ Features: Cross-GL-FGF (SOTA Interaction), High-Freq Mamba, No SK-Fusion")
 
         # --- 1. 左路: Spatial Encoder (ConvNeXt V2 Base) ---
         backbone_name = cnext_type if cnext_type else 'convnextv2_base'
@@ -265,23 +320,10 @@ class S_DMFNet(nn.Module):
             self.freq_layers.append(WaveletMambaBlock(f_dims[i], f_dims[i+1]))
         self.freq_stage4 = WaveletMambaBlock(f_dims[3], f_dims[3])
 
-        # --- 3. [升级] 交互: Bi-FGF Modules ---
-        # 替换了原来的 FGF_Module
-        self.bi_fgf_modules = nn.ModuleList([Bi_FGF_Module(s_dims[i], f_dims[i]) for i in range(4)])
+        # --- 3. [升级] 交互: Cross_GL_FGF Modules ---
+        self.bi_fgf_modules = nn.ModuleList([Cross_GL_FGF(s_dims[i], f_dims[i]) for i in range(4)])
 
-        # --- 4. 🔥 [新增] Fusion: SK-Fusion ---
-        # 为每一层(包括瓶颈层)准备一个 SK 融合模块
-        self.sk_fusions = nn.ModuleList([
-            SK_Fusion(s_dims[0]), # Layer 1
-            SK_Fusion(s_dims[1]), # Layer 2
-            SK_Fusion(s_dims[2]), # Layer 3
-            SK_Fusion(s_dims[3])  # Layer 4 (Neck)
-        ])
         
-        # 保留对齐层 (为了将 f 对齐到 s，供 SK-Fusion 使用)
-        # 注意：其实 Bi-FGF 里已经有对齐层了，我们可以复用 Bi-FGF 里的参数，
-        # 但为了逻辑清晰，SK-Fusion 之前我们调用 Bi-FGF 里的 freq_align 即可，不需要额外定义。
-
         # --- 5. 解码器: 使用 Up_PHD 包装器 ---
         c1, c2, c3, c4 = s_dims
         
@@ -316,53 +358,33 @@ class S_DMFNet(nn.Module):
             f_feats.append(f_curr) # f2, f3, f4
         f_feats[-1] = self.freq_stage4(f_feats[-1])
 
-        # === Interaction (Bi-FGF) ===
-        s_clean = []    # 用于跳跃连接
-        f_enhanced = [] # 用于边缘监督和深层融合
+        # === Interaction (Cross-GL-FGF) ===
+        skips = []      # 用于 Skip Connection
+        f_enhanced = [] # 用于 Edge Head
         
         for i in range(4):
-            # 🔥 Bi-FGF 双向互洗
-            s_new, f_new = self.bi_fgf_modules[i](s_feats[i], f_feats[i])
-            s_clean.append(s_new)
-            f_enhanced.append(f_new)
-            
-        s1, s2, s3, x4 = s_clean
-        f1_enh, f2_enh, f3_enh, f4_enh = f_enhanced
+            # fusion_out: 融合后的特征 (Skip)
+            # f_out: 增强后的频率特征 (Deep Supervision)
+            fusion_out, f_out = self.bi_fgf_modules[i](s_feats[i], f_feats[i])
+            skips.append(fusion_out)
+            f_enhanced.append(f_out)
 
-        # === Neck (SK-Fusion) ===
-        # 1. 复用 Bi-FGF 中的对齐层，把 f4 变成 s4 的通道数
-        f4_aligned = self.bi_fgf_modules[3].freq_align(f4_enh)
-        # 2. SK-Fusion: 智能融合语义和频率
-        x4_fused = self.sk_fusions[3](x4, f4_aligned)
+        s1_fused, s2_fused, s3_fused, s4_fused = skips
 
-        # === Decoder (带 SK-Fusion 跳跃连接) ===
-        
-        # Layer 3 Skip
-        f3_aligned = self.bi_fgf_modules[2].freq_align(f3_enh)
-        skip3 = self.sk_fusions[2](s3, f3_aligned) # 🔥 SK 融合
-        d1 = self.up1(x4_fused, skip3)
-        
-        # Layer 2 Skip
-        f2_aligned = self.bi_fgf_modules[1].freq_align(f2_enh)
-        skip2 = self.sk_fusions[1](s2, f2_aligned) # 🔥 SK 融合
-        d2 = self.up2(d1, skip2)
-        
-        # Layer 1 Skip
-        f1_aligned = self.bi_fgf_modules[0].freq_align(f1_enh)
-        skip1 = self.sk_fusions[0](s1, f1_aligned) # 🔥 SK 融合
-        d3 = self.up3(d2, skip1)
+        # === Decoder ===
+        d1 = self.up1(s4_fused, s3_fused)
+        d2 = self.up2(d1, s2_fused)
+        d3 = self.up3(d2, s1_fused)
         
         d4 = self.final_up(d3)
         logits = self.outc(d4)
         
         # === Auxiliary Output ===
         if self.training:
-            # 🔥 关键改进: 使用 f_enhanced[0] 而不是 f_feats[0]
-            # 这里送入 Edge Head 的特征已经被 s1 (语义流) 清洗过，
-            # 抑制了水波纹/斑马线等伪边缘，Loss 计算更准。
+            # 🔥 [关键修正] 输入使用 f_enhanced[0] (清洗后的频率特征)
+            # 理由：利用语义流抑制了背景纹理噪声，使边缘监督更精准
             edge_logits_small = self.edge_head(f_enhanced[0])
             edge_logits = F.interpolate(edge_logits_small, size=logits.shape[2:], mode='bilinear', align_corners=True)
-            
             return logits, edge_logits
             
         return logits
