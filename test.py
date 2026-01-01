@@ -1,232 +1,249 @@
-# test.py
-
 import argparse
 import logging
 import os
 import sys
+import re
+import pandas as pd
 import torch
 import torch.nn.functional as F
+from pathlib import Path
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-from PIL import Image
 import numpy as np
 
-# --- 导入您项目中的核心模块 ---
+# 引入你的项目模块
 from unet import UNet
 from utils.data_loading import BasicDataset
-from utils.dice_score import dice_coeff
 
-# 一个小的常量，用于数值稳定
+# 设置日志
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
 _EPS = 1e-6
 
-
-def test_model(
-        net,
-        device,
-        test_loader,
-        threshold: float,
-        amp: bool = False,
-        save_predictions: bool = False,
-        output_dir: str = 'data/test/predictions'
-):
+def test_model_silent(net, device, test_loader, threshold=0.5, amp=False):
     """
-    在测试集上评估模型的最终性能。
+    静默版测试函数，只返回指标字典，不保存图片，不打印繁杂信息
     """
     net.eval()
     num_test_batches = len(test_loader)
-
-    total_tp = 0
-    total_fp = 0
-    total_fn = 0
-
-    if save_predictions:
-        os.makedirs(output_dir, exist_ok=True)
-        logging.info(f'Prediction masks will be saved to {output_dir}')
+    total_tp = 0; total_fp = 0; total_fn = 0
 
     with torch.no_grad():
-        with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
-            for i, batch in enumerate(tqdm(test_loader, total=num_test_batches, desc='Testing round', unit='batch')):
+        with torch.cuda.amp.autocast(enabled=amp):
+            for batch in tqdm(test_loader, total=num_test_batches, desc='  evaluating', unit='batch', leave=False):
                 images, true_masks = batch['image'], batch['mask']
+                images = images.to(device, dtype=torch.float32, memory_format=torch.channels_last)
+                true_masks = true_masks.to(device, dtype=torch.long)
 
-                images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                true_masks = true_masks.to(device=device, dtype=torch.long)
-
-                # 🔥【修改 1】获取输出并进行兼容性处理
+                # 推理
                 output = net(images)
-
-                # 虽然 eval 模式通常只返回 Mask，但为了防止代码逻辑变动导致报错，加一个判断更稳健
+                
+                # 兼容性处理
                 if isinstance(output, tuple):
-                    masks_pred = output[0]  # 只取 Mask，丢弃 Edge
+                    masks_pred = output[0]
                 else:
                     masks_pred = output
 
-                # 裁剪logits以保证一致性
-                masks_pred_clipped = torch.clamp(masks_pred, min=-50, max=50)
+                masks_pred = torch.clamp(masks_pred, min=-50, max=50)
 
-                if net.n_classes == 1:
-                    # 二分类任务
-                    pred_probs = torch.sigmoid(masks_pred_clipped)
-                    pred_binary = (pred_probs > threshold).float()
-                    true_binary = true_masks.float()
+                # 二分类指标计算
+                pred_probs = torch.sigmoid(masks_pred)
+                pred_binary = (pred_probs > threshold).float()
+                true_binary = true_masks.float()
 
-                    # 展平以便计算
-                    p_flat = pred_binary.view(-1)
-                    t_flat = true_binary.view(-1)
+                p_flat = pred_binary.view(-1)
+                t_flat = true_binary.view(-1)
+                
+                total_tp += (p_flat * t_flat).sum()
+                total_fp += (p_flat * (1 - t_flat)).sum()
+                total_fn += ((1 - p_flat) * t_flat).sum()
 
-                    # 累加 TP, FP, FN
-                    total_tp += (p_flat * t_flat).sum()
-                    total_fp += (p_flat * (1 - t_flat)).sum()
-                    total_fn += ((1 - p_flat) * t_flat).sum()
-
-                    # 保存预测图像
-                    if save_predictions:
-                        start_idx = i * test_loader.batch_size
-                        for j in range(pred_binary.shape[0]):
-                            idx = start_idx + j
-                            if idx < len(test_loader.dataset.ids):
-                                file_id = test_loader.dataset.ids[idx]
-                                pred_mask_np = pred_binary[j].squeeze().cpu().numpy().astype(np.uint8) * 255
-                                pred_mask_img = Image.fromarray(pred_mask_np)
-                                pred_mask_img.save(os.path.join(output_dir, f'{file_id}_pred.png'))
-                else:
-                    logging.warning("Multi-class evaluation not implemented in this test script.")
-                    pass
-
-    # --- 计算全局指标 ---
+    # 计算全局指标
     dice = (2 * total_tp + _EPS) / (2 * total_tp + total_fp + total_fn + _EPS)
     iou = (total_tp + _EPS) / (total_tp + total_fp + total_fn + _EPS)
     precision = (total_tp + _EPS) / (total_tp + total_fp + _EPS)
     recall = (total_tp + _EPS) / (total_tp + total_fn + _EPS)
     f1 = (2 * precision * recall + _EPS) / (precision + recall + _EPS)
 
-    metrics = {
-        'dice': float(dice),
-        'iou': float(iou),
-        'precision': float(precision),
-        'recall': float(recall),
-        'f1': float(f1)
+    return {
+        'Dice': float(dice), 
+        'IoU': float(iou), 
+        'F1': float(f1), 
+        'Precision': float(precision), 
+        'Recall': float(recall)
     }
 
-    return metrics
-
-
 def get_args():
-    parser = argparse.ArgumentParser(description='Test a trained U-Net model on a test set')
-    parser.add_argument('--model', '-m', type=str, required=True,
-                        help='Path to the trained model checkpoint (.pth file)')
-    parser.add_argument('--test-img-dir', type=str, default='data/test/imgs/',
-                        help='Directory of test images')
-    parser.add_argument('--test-mask-dir', type=str, default='data/test/masks/',
-                        help='Directory of test masks')
-    parser.add_argument('--scale', '-s', type=float, default=0.5,
-                        help='Scale factor for the input images (must match training)')
-    parser.add_argument('--threshold', '-t', type=float, default=None,
-                        help='Fixed threshold. If not set, use best_threshold from checkpoint.')
-    parser.add_argument('--batch-size', '-b', type=int, default=8, help='Batch size for testing')
-    parser.add_argument('--save-preds', action='store_true', default=False, help='Save prediction masks')
-    parser.add_argument('--output-dir', type=str, default='data/test/predictions',
-                        help='Directory to save prediction masks')
+    parser = argparse.ArgumentParser(description='Batch Test Checkpoints')
+    
+    # === 🔥 核心控制参数 ===
+    parser.add_argument('--checkpoint-dir', '-d', type=str, required=True, help='存放 .pth 的文件夹')
+    parser.add_argument('--start-epoch', type=int, default=0, help='测试起始轮次 (包含)')
+    parser.add_argument('--end-epoch', type=int, default=1000, help='测试结束轮次 (包含)')
+    parser.add_argument('--include-best', action='store_true', default=False, help='是否同时也测试 checkpoint_best.pth')
+    parser.add_argument('--output-file', type=str, default='batch_test_results.csv', help='结果保存路径')
+    
+    # === 数据集参数 ===
+    parser.add_argument('--test-img-dir', type=str, default='data/test/imgs/')
+    parser.add_argument('--test-mask-dir', type=str, default='data/test/masks/')
+    parser.add_argument('--scale', '-s', type=float, default=1.0)
+    parser.add_argument('--batch-size', '-b', type=int, default=1)
+    
+    # === 架构参数 (必须与 train.py / test01.py 一致) ===
+    parser.add_argument('--encoder', type=str, default='resnet', choices=['resnet', 'cnextv2', 'standard'])
+    parser.add_argument('--decoder', type=str, default='phd', choices=['phd', 'standard'])
+    parser.add_argument('--cnext-type', type=str, default='convnextv2_base')
+    parser.add_argument('--bilinear', action='store_true', default=False)
+    parser.add_argument('--classes', '-c', type=int, default=1)
+    
+    # === SOTA 模块开关 ===
+    parser.add_argument('--use-dcn', action='store_true', default=False, help='Enable DCNv3')
+    parser.add_argument('--use-dubm', action='store_true', default=False, help='Enable D-UBM')
+    parser.add_argument('--use-dual-stream', action='store_true', default=False, help='Enable Dual Stream')
+    parser.add_argument('--use-wavelet-denoise', action='store_true', default=False, help='Enable Wavelet')
+    parser.add_argument('--use-dsis', action='store_true', default=False)
+    parser.add_argument('--use-strg', action='store_true', default=False)
+    parser.add_argument('--use-unet3p', action='store_true', default=False)
+    
+    # 其他增强参数
+    parser.add_argument('--use-wgn-enhancement', action='store_true', default=False)
+    parser.add_argument('--use-cafm', action='store_true', default=False)
+    parser.add_argument('--use-edge-loss', action='store_true', default=False)
+    parser.add_argument('--wgn-base-order', type=int, default=3)
+    parser.add_argument('--wgn-orders', type=str, default=None)
 
-    # --- 🔥【修改 2】补全模型结构参数 (必须与 train.py 一致) ---
-    parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=1, help='Number of classes')
-    parser.add_argument('--use-cafm', action='store_true', default=False, help='Enable Advanced CAFM module')
-    parser.add_argument('--use-resnet-encoder', action='store_true', default=False, help='Use ResNet50 encoder')
-
-    # WGN 相关参数 (如果不加这些，加载权重时会报错)
-    parser.add_argument('--use-wgn-enhancement', action='store_true', default=False, help='Use WGN enhancement')
-    parser.add_argument('--wgn-base-order', type=int, default=3, help='Base order for WGN blocks')
-    parser.add_argument('--wgn-orders', type=str, default=None, help='Custom WGN orders')
- # 在 test.py 的 get_args() 函数里添加：
-    parser.add_argument('--use-edge-loss', action='store_true', default=False,
-                        help='Enable auxiliary edge decoder (needed for loading weights)')
     return parser.parse_args()
 
+def extract_epoch(filename):
+    """从文件名提取 epoch 数字"""
+    match = re.search(r'epoch_(\d+)', filename)
+    if match:
+        return int(match.group(1))
+    return None
 
-if __name__ == '__main__':
+def main():
     args = get_args()
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logging.info(f'Using device {device}')
-
-    # 🔥【修改 3】处理 WGN Orders (逻辑复制自 train.py)
-    wgn_orders = None
-    if args.use_wgn_enhancement and args.wgn_orders:
-        orders_list = [int(x) for x in args.wgn_orders.split(',')]
-        if len(orders_list) == 6:
-            wgn_orders = {
-                'layer1': (orders_list[0], orders_list[1]),
-                'layer2': (orders_list[2], orders_list[3]),
-                'layer3': (orders_list[4], orders_list[5])
-            }
-    elif args.use_wgn_enhancement:
-        base = args.wgn_base_order
-        wgn_orders = {
-            'layer1': (base, base - 1),
-            'layer2': (base + 1, base),
-            'layer3': (base + 2, base + 1)
-        }
-
-    # 1. 创建模型 (必须传入 wgn_orders 和 use_wgn_enhancement)
-    model = UNet(n_channels=3,
-                 n_classes=args.classes,
-                 bilinear=args.bilinear,
-                 use_advanced_cafm=args.use_cafm,
-                 use_resnet_encoder=args.use_resnet_encoder,
-                 use_wgn_enhancement=args.use_wgn_enhancement,  # 🔥 传入参数
-                 wgn_orders=wgn_orders,
-                 use_edge_loss=args.use_edge_loss)  # 🔥 传入参数
-
-    # 2. 加载模型权重
-    logging.info(f'Loading model from {args.model}')
-    try:
-        checkpoint = torch.load(args.model, map_location=device, weights_only=False)
-    except FileNotFoundError:
-        logging.error(f"Checkpoint file not found at {args.model}")
+    
+    # 1. 扫描并筛选 Checkpoints
+    ckpt_dir = Path(args.checkpoint_dir)
+    all_files = [f for f in os.listdir(ckpt_dir) if f.endswith('.pth')]
+    
+    tasks = [] # 存储 (filename, epoch_num, is_special)
+    
+    for f in all_files:
+        # 处理 checkpoint_epoch_XX.pth
+        ep = extract_epoch(f)
+        if ep is not None:
+            # 筛选范围
+            if args.start_epoch <= ep <= args.end_epoch:
+                tasks.append((f, ep, False))
+        
+        # 处理 checkpoint_best.pth
+        elif f == 'checkpoint_best.pth' and args.include_best:
+            tasks.append((f, 999999, True)) # 999999 只是为了排序放在最后
+    
+    # 按 epoch 排序
+    tasks.sort(key=lambda x: x[1])
+    
+    if not tasks:
+        logging.error(f"No checkpoints found in range [{args.start_epoch}, {args.end_epoch}] in {ckpt_dir}")
         sys.exit(1)
 
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-        logging.info('Loaded model weights from a full checkpoint.')
-        if 'val_dice' in checkpoint:
-            logging.info(f'Best Val Dice: {checkpoint["val_dice"]:.4f}')
-    else:
-        model.load_state_dict(checkpoint)
-        logging.warning('Loaded a legacy checkpoint.')
+    logging.info(f"📋 Found {len(tasks)} checkpoints to test.")
 
-    model.to(device=device)
-
-    # 3. 创建测试数据集
+    # 2. 准备数据 (只加载一次)
     try:
         test_dataset = BasicDataset(args.test_img_dir, args.test_mask_dir, args.scale)
-        test_loader = torch.utils.data.DataLoader(
+        test_loader = DataLoader(
             test_dataset, batch_size=args.batch_size, shuffle=False,
             num_workers=max(1, os.cpu_count() // 2), pin_memory=True, drop_last=False
         )
+        logging.info(f"✅ Loaded dataset: {len(test_dataset)} images")
     except Exception as e:
         logging.error(f"Dataset Error: {e}")
         sys.exit(1)
 
-    # 4. 确定阈值
-    if args.threshold is not None:
-        best_threshold = args.threshold
-    elif 'best_threshold_f1' in checkpoint:
-        best_threshold = checkpoint['best_threshold_f1']
-        logging.info(f"Using best F1 threshold: {best_threshold:.4f}")
-    else:
-        best_threshold = 0.5
+    # 3. 构建模型 (只构建一次)
+    # WGN Orders 处理
+    wgn_orders = None
+    if args.use_wgn_enhancement:
+        if args.wgn_orders:
+            orders_list = [int(x) for x in args.wgn_orders.split(',')]
+            wgn_orders = {'layer1': (orders_list[0], orders_list[1]), 'layer2': (orders_list[2], orders_list[3]), 'layer3': (orders_list[4], orders_list[5])}
+        else:
+            base = args.wgn_base_order
+            wgn_orders = {'layer1': (base, base-1), 'layer2': (base+1, base), 'layer3': (base+2, base+1)}
 
-    # 5. 执行测试
-    final_metrics = test_model(
-        model, device, test_loader,
-        threshold=best_threshold, amp=False,
-        save_predictions=args.save_preds, output_dir=args.output_dir
+    logging.info(f"🏗️ Building Model... Encoder: {args.cnext_type}")
+    model = UNet(
+        n_channels=3,
+        n_classes=args.classes,
+        bilinear=args.bilinear,
+        encoder_name=args.encoder,
+        decoder_name=args.decoder,
+        cnext_type=args.cnext_type,
+        use_wgn_enhancement=args.use_wgn_enhancement,
+        use_cafm=args.use_cafm,
+        use_edge_loss=args.use_edge_loss,
+        wgn_orders=wgn_orders,
+        use_dcn_in_phd=args.use_dcn,
+        use_dsis=args.use_dsis,
+        use_dubm=args.use_dubm,
+        use_strg=args.use_strg,
+        use_dual_stream=args.use_dual_stream,
+        use_unet3p=args.use_unet3p,
+        use_wavelet_denoise=args.use_wavelet_denoise
     )
+    model.to(device)
 
-    # 6. 打印结果
-    print("\n" + "=" * 50)
-    print("         Final Test Set Evaluation Report")
-    print("-" * 50)
-    for k, v in final_metrics.items():
-        print(f"  - Global {k.upper()}: {v:.4f}")
-    print("=" * 50)
+    # 4. 批量测试循环
+    results = []
+    
+    print("\n" + "="*90)
+    print(f"{'Checkpoint':<30} | {'Dice':<8} | {'IoU':<8} | {'F1':<8} | {'Pre':<8} | {'Rec':<8}")
+    print("-" * 90)
+
+    for fname, epoch, is_special in tasks:
+        ckpt_path = ckpt_dir / fname
+        
+        try:
+            # 加载权重
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+            
+            # 运行测试
+            metrics = test_model_silent(model, device, test_loader, threshold=0.5, amp=False)
+            
+            # 记录数据
+            row = {
+                'Checkpoint': fname,
+                'Epoch': epoch if not is_special else 'Best',
+                **metrics
+            }
+            results.append(row)
+            
+            # 实时打印
+            print(f"{fname:<30} | {metrics['Dice']:.4f}   | {metrics['IoU']:.4f}   | {metrics['F1']:.4f}   | {metrics['Precision']:.4f}   | {metrics['Recall']:.4f}")
+
+        except Exception as e:
+            logging.error(f"Error testing {fname}: {e}")
+
+    print("=" * 90)
+
+    # 5. 保存结果
+    if results:
+        df = pd.DataFrame(results)
+        df.to_csv(args.output_file, index=False)
+        
+        # 找出最佳轮次 (基于 Dice)
+        best_row = df.loc[df['Dice'].idxmax()]
+        print(f"\n🏆 Best Checkpoint in Batch: {best_row['Checkpoint']}")
+        print(f"   Dice: {best_row['Dice']:.4f} | IoU: {best_row['IoU']:.4f} | F1: {best_row['F1']:.4f}")
+        print(f"\n💾 Results saved to: {args.output_file}")
+
+if __name__ == '__main__':
+    main()

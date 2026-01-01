@@ -505,7 +505,7 @@ def train_model(
             # Latest
             torch.save(checkpoint, str(dir_checkpoint / 'checkpoint_latest.pth'))
             # 2. 🔥 [修改点 2] 30轮以后，每一轮都额外保存一个文件
-            if epoch > 30:
+            if epoch > 20:
                 # 文件名例如: checkpoint_epoch_31.pth, checkpoint_epoch_32.pth ...
                 epoch_path = str(dir_checkpoint / f'checkpoint_epoch_{epoch}.pth')
                 torch.save(checkpoint, epoch_path)
@@ -636,7 +636,7 @@ def get_args():
     parser.add_argument('--loss-weights', type=str, default='1.0,1.0')
     parser.add_argument('--focal-alpha', type=float, default=0.25)
     parser.add_argument('--focal-gamma', type=float, default=2.0)
-    parser.add_argument('--weight-decay', type=float, default=1e-8)
+    parser.add_argument('--weight-decay', type=float, default=0.0005)
     parser.add_argument('--momentum', type=float, default=0.999)
     parser.add_argument('--gradient-clipping', type=float, default=1.0)
     parser.add_argument('--backbone-lr-scale', type=float, default=0.1)
