@@ -275,7 +275,7 @@ def train_model(
                                   momentum=momentum, foreach=True)
         logging.info('✅ Using RMSprop optimizer')
 
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-9)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
     # 损失函数
@@ -505,7 +505,7 @@ def train_model(
             # Latest
             torch.save(checkpoint, str(dir_checkpoint / 'checkpoint_latest.pth'))
             # 2. 🔥 [修改点 2] 30轮以后，每一轮都额外保存一个文件
-            if epoch > 20:
+            if epoch > 1:
                 # 文件名例如: checkpoint_epoch_31.pth, checkpoint_epoch_32.pth ...
                 epoch_path = str(dir_checkpoint / f'checkpoint_epoch_{epoch}.pth')
                 torch.save(checkpoint, epoch_path)
@@ -605,7 +605,7 @@ def get_args():
     # 架构参数
     parser.add_argument('--encoder', type=str, default='resnet', choices=['resnet', 'cnextv2', 'standard'])
     parser.add_argument('--decoder', type=str, default='phd', choices=['phd', 'standard'])
-    parser.add_argument('--cnext-type', type=str, default='convnextv2_tiny')
+    parser.add_argument('--cnext-type', type=str, default='convnextv2_base')
     
     # SOTA 模块开关
     parser.add_argument('--use-dcn', action='store_true', default=False, help='Enable standard DCNv3')
@@ -626,6 +626,7 @@ def get_args():
     parser.add_argument('--use-edge-loss', action='store_true', default=False, help='Legacy WGN Edge Loss (Deprecated logic removed)')
     parser.add_argument('--use-fme', action='store_true', default=False, 
                         help='Enable Frequency-Mamba Enhancement (FME) module')
+    parser.add_argument('--no-mfam', action='store_true', help='Disable MFAM for ablation study')
     # WGN 参数
     parser.add_argument('--wgn-base-order', type=int, default=3)
     parser.add_argument('--wgn-orders', type=str, default=None)
@@ -683,7 +684,8 @@ if __name__ == '__main__':
         use_dual_stream=args.use_dual_stream, # 🔥 新增双流
         use_dsis=args.use_dsis, # 🔥 传入参数
         use_unet3p=args.use_unet3p, # 🔥 传入参数
-        use_wavelet_denoise=args.use_wavelet_denoise  # 👈 传入这个参数
+        use_wavelet_denoise=args.use_wavelet_denoise,  # 👈 传入这个参数
+        use_mfam=not args.no_mfam, # 注意这里：如果命令行加了 --no-mfam，则 use_mfam=False
           # 🔥 传入 MDBES-Net 解耦参数
     )
     

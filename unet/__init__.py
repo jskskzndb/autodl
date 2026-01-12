@@ -39,4 +39,11 @@
 # from .unet_modelV3 import UNet
 # 🔥 新的导入：指向 S-DMFNet
 #from .unet_s_dmfnet import S_DMFNet as UNet
-from .unet_s_dmfnet2 import S_DMFNet as UNet
+#from .unet_s_dmfnet2 import S_DMFNet as UNet
+#from .unet_s_dmfnet3 import S_DMFNet as UNet
+#from .unet_cnext_standard import UNet_CNext_Standard as UNet
+# 🟢 选项: PHD 消融模型 (ConvNeXt + PHD Decoder only)
+from .unet_cnext_phd import UNet_CNext_PHD as UNet
+# 采用过拟合优化后的模型
+#from .unet_cnext_phd2 import UNet_CNext_PHD as UNet
+#from .unet_cnext_phd3 import UNet_CNext_PHD as UNet
