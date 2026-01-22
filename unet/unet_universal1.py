@@ -207,47 +207,136 @@ class StandardDoubleConv(nn.Module):
             nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False), nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
         )
     def forward(self, x): return self.double_conv(x)
+# ================================================================
+# [New Architecture] ProtoFormer Decoder Components
+# ================================================================
 
-# --- D. 解码器组件 2: PHD Pro (改进版) ---
-class PHD_DecoderBlock_Pro(nn.Module):
-    def __init__(self, in_channels, out_channels, expand_ratio=4):
+class PrototypeInteractionBlock(nn.Module):
+    """
+    [ProtoFormer Core] 原型交互单元 (完全体)
+    功能: 利用可学习的原型(Prototypes)对特征图进行语义重构。
+    包含防御机制:
+      1. 动态位置编码 (Learnable PE) -> 防止空间信息丢失
+      2. 局部细节卷积 (Local Conv) -> 补充高频纹理
+    """
+    def __init__(self, channels, num_prototypes=16):
         super().__init__()
-        hidden_dim = int(out_channels * expand_ratio)
-        self.align = nn.Sequential(nn.Conv2d(in_channels, out_channels, 1, bias=False), nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True))
+        self.channels = channels
         
-        # Inverted Bottleneck
-        self.expand = nn.Sequential(nn.Conv2d(out_channels, hidden_dim, 1, bias=False), nn.BatchNorm2d(hidden_dim), nn.GELU())
+        # 1. 定义原型 (Learnable Prompts) [1, N, C]
+        # 这些向量在训练中会学成"建筑"、"道路"、"背景"等概念
+        self.prototypes = nn.Parameter(torch.randn(1, num_prototypes, channels))
         
-        # Dual Stream (Local + Global)
-        self.local = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, (1,7), padding=(0,3), groups=hidden_dim, bias=False),
-            nn.Conv2d(hidden_dim, hidden_dim, (7,1), padding=(3,0), groups=hidden_dim, bias=False),
-            nn.BatchNorm2d(hidden_dim), nn.ReLU(inplace=True)
-        )
-        self.global_branch = MambaLayer2D(hidden_dim)
+        # 2. 动态位置编码库 (Learnable PE)
+        # 初始化一个 64x64 的位置编码，使用时自动插值
+        self.pos_embed = nn.Parameter(torch.randn(1, channels, 64, 64) * 0.02)
         
-        # Fusion (Simplified SK)
-        self.fusion_conv = nn.Conv2d(hidden_dim*2, hidden_dim, 1)
+        # 3. 投影层 (用于 Attention)
+        self.q_proj = nn.Conv2d(channels, channels, 1)
+        self.k_proj = nn.Linear(channels, channels)
+        self.v_proj = nn.Linear(channels, channels)
         
-        self.proj = nn.Sequential(nn.Conv2d(hidden_dim, out_channels, 1, bias=False), nn.BatchNorm2d(out_channels))
+        self.out_proj = nn.Conv2d(channels, channels, 1)
         
-        # FFN
-        ffn_dim = out_channels * 4
-        self.ffn = nn.Sequential(
-            nn.Conv2d(out_channels, ffn_dim, 1), nn.BatchNorm2d(ffn_dim), nn.GELU(),
-            nn.Conv2d(ffn_dim, out_channels, 1), nn.BatchNorm2d(out_channels)
+        # GroupNorm 比 BN 在这种 Attention 结构下更稳
+        self.norm = nn.GroupNorm(8, channels)
+        
+        # 4. 局部细节补充 (救命稻草)
+        # 专门用来提取 Attention 忽略掉的细碎边缘
+        self.local_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU()
         )
 
     def forward(self, x):
+        B, C, H, W = x.shape
+        residual = x
+        
+        # --- A. 注入位置信息 (防御空间丢失) ---
+        # 动态插值位置编码到当前尺寸
+        pos = F.interpolate(self.pos_embed, size=(H, W), mode='bilinear', align_corners=False)
+        x_with_pos = x + pos 
+        
+        # --- B. 准备 Query (图像) ---
+        # [B, C, H, W] -> [B, HW, C]
+        q = self.q_proj(x_with_pos).flatten(2).transpose(1, 2)
+        
+        # --- C. 准备 Key/Value (原型) ---
+        # [1, N, C] -> [B, N, C]
+        protos = self.prototypes.repeat(B, 1, 1)
+        k = self.k_proj(protos)
+        v = self.v_proj(protos)
+        
+        # --- D. 语义交互 (Cross Attention) ---
+        # 计算像素与原型的相似度: [B, HW, C] @ [B, C, N] -> [B, HW, N]
+        scale = C ** -0.5
+        attn = (q @ k.transpose(-2, -1)) * scale
+        attn = attn.softmax(dim=-1) # 归一化: 每个像素必须选一个最像的原型
+        
+        # --- E. 重构特征 ---
+        # 用原型的信息重组图像: [B, HW, N] @ [B, N, C] -> [B, HW, C]
+        out = attn @ v
+        out = out.transpose(1, 2).view(B, C, H, W)
+        
+        # --- F. 融合与输出 ---
+        out = self.out_proj(out)
+        
+        # 加上局部卷积，补充丢失的纹理
+        out = out + self.local_conv(out)
+        
+        return self.norm(out + residual)
+
+
+class PrototypeQueryHead(nn.Module):
+    """
+    [Optional] 原型查询输出头
+    替代最后的 1x1 Conv，用作语义精炼。
+    """
+    def __init__(self, in_channels, num_prototypes=32, num_classes=1):
+        super().__init__()
+        self.num_prototypes = num_prototypes
+        # 独立的头原型
+        self.prototypes = nn.Parameter(torch.randn(num_prototypes, in_channels))
+        # 简单的融合层
+        self.merge_conv = nn.Conv2d(num_prototypes, num_classes, 1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        pixel_features = x.view(B, C, -1) 
+        # 准备原型 [1, C, N]
+        queries = self.prototypes.unsqueeze(0).transpose(1, 2).repeat(B, 1, 1)
+        # 相似度匹配 [B, HW, N]
+        sim_map = torch.bmm(pixel_features.transpose(1, 2), queries)
+        # 还原空间 [B, N, H, W]
+        mask_predictions = sim_map.permute(0, 2, 1).view(B, self.num_prototypes, H, W)
+        # 输出
+        return self.merge_conv(mask_predictions)
+
+
+class PHD_DecoderBlock_Pro(nn.Module):
+    """
+    [New Decoder Wrapper] ProtoFormer 解码块
+    完全替代旧版 PHD，对外接口保持不变。
+    """
+    def __init__(self, in_channels, out_channels, expand_ratio=None): 
+        super().__init__()
+        
+        # 1. 空间对齐 (3x3 Conv)
+        self.align = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 2. 原型交互核心 (每层独立拥有 16 个原型)
+        self.proto_block = PrototypeInteractionBlock(out_channels, num_prototypes=16)
+        
+    def forward(self, x):
+        # 对齐
         x = self.align(x)
-        shortcut = x
-        x_exp = self.expand(x)
-        x_loc = self.local(x_exp)
-        x_glo = self.global_branch(x_exp)
-        x_fused = self.fusion_conv(torch.cat([x_loc, x_glo], dim=1))
-        x_out = self.proj(x_fused)
-        x = shortcut + x_out
-        x = x + self.ffn(x)
+        # 交互重构
+        x = self.proto_block(x)
         return x
 
 # --- E. 通用上采样包装器 ---

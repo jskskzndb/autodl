@@ -18,7 +18,7 @@ from utils.data_loading import BasicDataset
 from utils.dice_score import dice_loss
 
 from timm.scheduler import CosineLRScheduler  # 🔥 [新增 1] 添加这一行
-from utils.losses import FocalLoss, CombinedLoss, DiceLossOnly, EdgeLoss
+from utils.losses import FocalLoss, CombinedLoss, DiceLossOnly, EdgeLoss, compute_prototype_ortho_loss
 from utils.utils import log_grad_stats
 
 from unet import UNet
@@ -409,6 +409,17 @@ def train_model(
                                # ✅ 加个 float() 保平安
                             loss_e = edge_criterion(masks_pred.float(), true_masks.float()) 
                             loss += lambda_edge * loss_e
+                    # =================================================================
+                    # 🔥 [新增插入位置] 原型正交 Loss (防止 ProtoFormer 坍塌)
+                    # =================================================================
+                    # 只有当模型里真的有 prototypes 参数时，这个 loss 才有值
+                    # 建议权重 0.01，既能约束原型互斥，又不会干扰主分割任务
+                    lambda_ortho = 0.01 
+                    ortho_loss = compute_prototype_ortho_loss(model, device=device)
+                    
+                    # 将正交 Loss 加到总 Loss 中
+                    loss += lambda_ortho * ortho_loss
+                    # =================================================================
                      # 🔥 [修改点 1] Loss 归一化
                      # 如果我们要累计 2 步，那么每步的 Loss 应该除以 2
                     loss = loss / accumulation_steps
