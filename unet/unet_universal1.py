@@ -209,65 +209,46 @@ class StandardDoubleConv(nn.Module):
     def forward(self, x): return self.double_conv(x)
 
 # --- D. 解码器组件 2: PHD Pro (改进版) ---
-# === 替换原有的 PHD_DecoderBlock_Pro 类 ===
-
 class PHD_DecoderBlock_Pro(nn.Module):
-    """
-    [PHD-Hybrid Final] 最终混合版解码器 (已修复)
-    配置:
-    1. Align: 3x3 Conv (解决 Dice 掉点)
-    2. Local: 调用 StripConvBlock (使用 DCN 条形卷积)
-    3. Global: Mamba (全局上下文)
-    4. Expand: 1.5x (解决 Loss 降不下去)
-    """
-    def __init__(self, in_channels, out_channels, expand_ratio=1.5): # 默认倍率改为 1.5
+    def __init__(self, in_channels, out_channels, expand_ratio=4):
         super().__init__()
-        
-        # 1. 入口对齐：改回 3x3 卷积，这至关重要！(原代码是 1x1)
-        self.align = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-        
-        # 中间维度
         hidden_dim = int(out_channels * expand_ratio)
+        self.align = nn.Sequential(nn.Conv2d(in_channels, out_channels, 1, bias=False), nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True))
         
-        # 2. 局部流：调用你刚刚写好的 StripConvBlock
-        # 注意：这里我们传入 out_channels，让 Block 内部去处理投影
-        self.local_branch = StripConvBlock(out_channels, hidden_dim, kernel_size=7, use_dcn=True)
+        # Inverted Bottleneck
+        self.expand = nn.Sequential(nn.Conv2d(out_channels, hidden_dim, 1, bias=False), nn.BatchNorm2d(hidden_dim), nn.GELU())
         
-        # 3. 全局流：Mamba (及投影)
-        self.global_proj = nn.Conv2d(out_channels, hidden_dim, 1)
-        if 'MambaLayer2D' in globals():
-            self.global_branch = MambaLayer2D(hidden_dim)
-        else:
-            self.global_branch = nn.Identity()
-
-        # 4. 融合层
-        self.fusion_conv = nn.Sequential(
-             nn.Conv2d(hidden_dim * 2, out_channels, 1, bias=False),
-             nn.BatchNorm2d(out_channels),
-             nn.ReLU(inplace=True)
+        # Dual Stream (Local + Global)
+        self.local = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, (1,7), padding=(0,3), groups=hidden_dim, bias=False),
+            nn.Conv2d(hidden_dim, hidden_dim, (7,1), padding=(3,0), groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim), nn.ReLU(inplace=True)
+        )
+        self.global_branch = MambaLayer2D(hidden_dim)
+        
+        # Fusion (Simplified SK)
+        self.fusion_conv = nn.Conv2d(hidden_dim*2, hidden_dim, 1)
+        
+        self.proj = nn.Sequential(nn.Conv2d(hidden_dim, out_channels, 1, bias=False), nn.BatchNorm2d(out_channels))
+        
+        # FFN
+        ffn_dim = out_channels * 4
+        self.ffn = nn.Sequential(
+            nn.Conv2d(out_channels, ffn_dim, 1), nn.BatchNorm2d(ffn_dim), nn.GELU(),
+            nn.Conv2d(ffn_dim, out_channels, 1), nn.BatchNorm2d(out_channels)
         )
 
     def forward(self, x):
-        # 1. 空间对齐
         x = self.align(x)
         shortcut = x
-        
-        # 2. 双流处理
-        # Local: StripConvBlock
-        x_loc = self.local_branch(x)
-        
-        # Global: Mamba
-        x_glo = self.global_branch(self.global_proj(x))
-        
-        # 3. 融合
+        x_exp = self.expand(x)
+        x_loc = self.local(x_exp)
+        x_glo = self.global_branch(x_exp)
         x_fused = self.fusion_conv(torch.cat([x_loc, x_glo], dim=1))
-        
-        # 4. 残差连接 (去掉了 FFN)
-        return shortcut + x_fused
+        x_out = self.proj(x_fused)
+        x = shortcut + x_out
+        x = x + self.ffn(x)
+        return x
 
 # --- E. 通用上采样包装器 ---
 class Up_Universal(nn.Module):
