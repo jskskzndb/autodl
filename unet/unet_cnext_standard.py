@@ -67,7 +67,7 @@ class Standard_Up(nn.Module):
         return self.conv(x)
 
 class UNet_CNext_Standard(nn.Module):
-    def __init__(self, n_classes=1, cnext_type='convnextv2_base', **kwargs):
+    def __init__(self, n_classes=1, cnext_type='convnextv2_base', pretrained=True, **kwargs):
         super().__init__()
         
         # 🔥 [修复1] 必须初始化 n_classes，train.py 需要读取它
@@ -76,14 +76,19 @@ class UNet_CNext_Standard(nn.Module):
         print(f"🧪 [Ablation Baseline] ConvNeXt + Standard UNet Decoder")
         print(f"   - Encoder: {cnext_type}")
         print(f"   - Decoder: Standard DoubleConv")
-        
+        # 👇 2. 打印当前权重状态，防止跑错
+        if pretrained:
+            print(f"   - Weights: ✅ Loaded ImageNet Pretrained")
+        else:
+            print(f"   - Weights: ❌ Random Initialization (Training from Scratch)")
         # --- 1. Encoder: ConvNeXt V2 ---
         # 🔥 [修复2] 改名为 'spatial_encoder' 以匹配 train.py 的差分学习率逻辑
         self.spatial_encoder = timm.create_model(
             cnext_type, 
-            pretrained=True, 
+            pretrained=pretrained,  # 👇 3. 这里传入参数，不再写死 True
             features_only=True, 
-            out_indices=(0, 1, 2, 3)
+            out_indices=(0, 1, 2, 3),
+            drop_path_rate=0.0      # 从零训练时 drop_path=0.0 是对的
         )
         
         # 获取通道数 (Base: [128, 256, 512, 1024])
