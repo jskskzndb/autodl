@@ -414,7 +414,7 @@ def train_model(
                     # =================================================================
                     # 只有当模型里真的有 prototypes 参数时，这个 loss 才有值
                     # 建议权重 0.01，既能约束原型互斥，又不会干扰主分割任务
-                    lambda_ortho = 0.01 
+                    lambda_ortho = 0 
                     ortho_loss = compute_prototype_ortho_loss(model, device=device)
                     
                     # 将正交 Loss 加到总 Loss 中

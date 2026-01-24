@@ -330,7 +330,7 @@ class PHD_DecoderBlock_Pro(nn.Module):
         )
         
         # 2. 原型交互核心 (每层独立拥有 16 个原型)
-        self.proto_block = PrototypeInteractionBlock(out_channels, num_prototypes=16)
+        self.proto_block = PrototypeInteractionBlock(out_channels, num_prototypes=8)
         
     def forward(self, x):
         # 对齐

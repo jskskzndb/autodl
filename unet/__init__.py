@@ -52,4 +52,4 @@
 
 #🟢 全能型 UNet
 #功能: 一个类实现 4 种架构组合，通过参数控制。
-from .unet_universal import UniversalUNet as UNet
+from .unet_universal1 import UniversalUNet as UNet
