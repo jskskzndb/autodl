@@ -137,15 +137,15 @@ def compute_prototype_ortho_loss(model, device):
         # 自动扫描模型中所有的 'prototypes' 参数
         if 'prototypes' in name and param.requires_grad:
             # param shape 通常是 [1, N, C] 或 [N, C]
-            P = param
+            P = param.float() 
             if P.dim() > 2: 
                 P = P.squeeze(0) # 变成 [N, C]
             
             # 1. 归一化 (只约束方向)
-            P_norm = F.normalize(P, p=2, dim=1)
+            P_norm = F.normalize(P, p=2, dim=1, eps=1e-6)
             
             # 2. 计算相似度矩阵 (Gram Matrix) [N, N]
-            gram_matrix = torch.mm(P_norm, P_norm.t())
+            identity = torch.eye(P.shape[0], device=device).float()
             
             # 3. 目标: 单位矩阵 (对角线1，其他0)
             identity = torch.eye(P.shape[0], device=device)

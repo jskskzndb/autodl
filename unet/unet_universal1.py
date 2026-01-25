@@ -253,36 +253,43 @@ class PrototypeInteractionBlock(nn.Module):
         B, C, H, W = x.shape
         residual = x
         
-        # --- A. 注入位置信息 (防御空间丢失) ---
-        # 动态插值位置编码到当前尺寸
+        # --- A. 注入位置信息 ---
         pos = F.interpolate(self.pos_embed, size=(H, W), mode='bilinear', align_corners=False)
         x_with_pos = x + pos 
         
-        # --- B. 准备 Query (图像) ---
-        # [B, C, H, W] -> [B, HW, C]
+        # --- B. 准备 Query ---
         q = self.q_proj(x_with_pos).flatten(2).transpose(1, 2)
         
-        # --- C. 准备 Key/Value (原型) ---
-        # [1, N, C] -> [B, N, C]
+        # --- C. 准备 Key/Value ---
         protos = self.prototypes.repeat(B, 1, 1)
         k = self.k_proj(protos)
         v = self.v_proj(protos)
         
         # --- D. 语义交互 (Cross Attention) ---
-        # 计算像素与原型的相似度: [B, HW, C] @ [B, C, N] -> [B, HW, N]
-        scale = C ** -0.5
-        attn = (q @ k.transpose(-2, -1)) * scale
-        attn = attn.softmax(dim=-1) # 归一化: 每个像素必须选一个最像的原型
+        # 🔥🔥🔥 [核心修复开始] 🔥🔥🔥
+        # 强制关闭 AMP，进入 FP32 安全区
+        with torch.cuda.amp.autocast(enabled=False):
+            # 1. 全部转为 float32
+            q_32 = q.float()
+            k_32 = k.float()
+            v_32 = v.float()
+            
+            # 2. 计算 Attention (在 FP32 下非常安全，不会溢出)
+            scale = C ** -0.5
+            attn_logits = (q_32 @ k_32.transpose(-2, -1)) * scale
+            attn = attn_logits.softmax(dim=-1) # Softmax 容易在 FP16 溢出，必须 FP32
+            
+            # 3. 重构
+            out = attn @ v_32
         
-        # --- E. 重构特征 ---
-        # 用原型的信息重组图像: [B, HW, N] @ [B, N, C] -> [B, HW, C]
-        out = attn @ v
+        # 4. 🔥 算完后，转回原本的精度 (FP16 或 FP32)，以便后续卷积层继续跑
+        out = out.to(x.dtype)
+        # 🔥🔥🔥 [核心修复结束] 🔥🔥🔥
+
         out = out.transpose(1, 2).view(B, C, H, W)
         
         # --- F. 融合与输出 ---
         out = self.out_proj(out)
-        
-        # 加上局部卷积，补充丢失的纹理
         out = out + self.local_conv(out)
         
         return self.norm(out + residual)

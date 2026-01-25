@@ -104,7 +104,7 @@ def get_args():
     parser.add_argument('--use-dsis', action='store_true', default=False)
     parser.add_argument('--use-strg', action='store_true', default=False)
     parser.add_argument('--use-unet3p', action='store_true', default=False)
-    
+    parser.add_argument('--use-deep-supervision', action='store_true', default=False, help='Enable Deep Supervision (matches training)')
     # 其他增强参数
     parser.add_argument('--use-wgn-enhancement', action='store_true', default=False)
     parser.add_argument('--use-cafm', action='store_true', default=False)
@@ -193,7 +193,8 @@ def main():
         use_strg=args.use_strg,
         use_dual_stream=args.use_dual_stream,
         use_unet3p=args.use_unet3p,
-        use_wavelet_denoise=args.use_wavelet_denoise
+        use_wavelet_denoise=args.use_wavelet_denoise,
+        use_deep_supervision=args.use_deep_supervision
     )
     model.to(device)
 

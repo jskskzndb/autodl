@@ -113,7 +113,8 @@ def get_args():
     parser.add_argument('--use-strg', action='store_true', default=False)
     parser.add_argument('--use-dual-stream', action='store_true', default=False) # 🔥 修复报错的关键
     parser.add_argument('--use-dsis', action='store_true', default=False, help='Enable Dual-Stream Interactive Skip Module')
-    
+    # 🔥🔥🔥 [修复点 1] 添加 Deep Supervision 参数 🔥🔥🔥
+    parser.add_argument('--use-deep-supervision', action='store_true', default=False, help='Enable Deep Supervision (matches training)')
     parser.add_argument('--use-unet3p', action='store_true', default=False, help='Enable UNet 3+ logic')
     # WGN 参数
     parser.add_argument('--wgn-base-order', type=int, default=3)
@@ -163,7 +164,8 @@ if __name__ == '__main__':
         use_strg=args.use_strg,            # 补上
         use_dual_stream=args.use_dual_stream,  # 🔥 传入双流开关
         use_unet3p=args.use_unet3p,        # 补上
-        use_wavelet_denoise=args.use_wavelet_denoise
+        use_wavelet_denoise=args.use_wavelet_denoise,
+        use_deep_supervision=args.use_deep_supervision
     )
 
     # 2. 加载权重
