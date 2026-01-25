@@ -28,14 +28,23 @@ import random
 def setup_seed(seed):
     import random
     import numpy as np
-    
+    import os  # 👈 确保导入 os
+    os.environ['PYTHONHASHSEED'] = str(seed) # 👈 新增：控制哈希算法随机性
     torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)       # 👈 修正：单卡使用这个
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True  # 保证算法结果确定
-    # torch.backends.cudnn.benchmark = False   # 建议注释掉。设为False会变慢，通常不值得
-
+    torch.backends.cudnn.benchmark = False   # 建议注释掉。设为False会变慢，通常不值得
+# 在 setup_seed 下方添加这个函数
+def worker_init_fn(worker_id):
+    import random
+    import numpy as np
+    # 获取 PyTorch 传下来的种子
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 def log_best_visuals(model, val_loader, device, num_samples=5):
     """
     将 原图、预测掩码、真值掩码 并排展示在 WandB 表格中。
@@ -195,9 +204,12 @@ def train_model(
 
     # 2. DataLoader
     num_workers = min(4, os.cpu_count()) if os.name == 'nt' else min(8, os.cpu_count())
+    # 🔥🔥🔥 [新增] 定义一个随机数生成器，并设定种子
+    g = torch.Generator()
+    g.manual_seed(42)  # 这里填你想要的种子，建议和全局种子保持一致
     loader_args = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
-    train_loader = DataLoader(train_dataset, shuffle=True, drop_last=True, **loader_args)
-    val_loader = DataLoader(val_dataset, shuffle=False, drop_last=True, **loader_args)
+    train_loader = DataLoader(train_dataset, shuffle=True, drop_last=True, worker_init_fn=worker_init_fn, generator=g, **loader_args)
+    val_loader = DataLoader(val_dataset, shuffle=False, drop_last=True, worker_init_fn=worker_init_fn, generator=g, **loader_args)
 
     # 3. WandB 初始化 (保留原有配置)
     # 🔥 [新增] 必须先定义 run_id，否则后面会报错
@@ -326,10 +338,30 @@ def train_model(
             scheduler.load_state_dict(checkpoint_to_load['scheduler_state_dict'])
             if 'grad_scaler_state_dict' in checkpoint_to_load and amp:
                 grad_scaler.load_state_dict(checkpoint_to_load['grad_scaler_state_dict'])
+            
+            # 🔥🔥🔥 [修改这里] 加上 .cpu() 🔥🔥🔥
+            if 'cpu_rng_state' in checkpoint_to_load:
+                # 1. 恢复 CPU 随机数 (必须是 CPU Tensor)
+                torch.set_rng_state(checkpoint_to_load['cpu_rng_state'].cpu())
+                
+                # 2. 恢复 CUDA 随机数 (通常 set_rng_state 也偏好 CPU tensor 作为输入来设置 GPU 状态)
+                try:
+                    if 'cuda_rng_state' in checkpoint_to_load:
+                        torch.cuda.set_rng_state(checkpoint_to_load['cuda_rng_state'].cpu())
+                except Exception as e:
+                    logging.warning(f"⚠️ 无法恢复 CUDA 随机状态 (可能显卡数量不一致): {e}")
+
+                # 3. 恢复 Numpy 和 Python 随机数 (这些不受 map_location 影响)
+                if 'numpy_rng_state' in checkpoint_to_load:
+                    np.random.set_state(checkpoint_to_load['numpy_rng_state'])
+                if 'py_rng_state' in checkpoint_to_load:
+                    random.setstate(checkpoint_to_load['py_rng_state'])
+                
+                logging.info("🎲 随机数生成器状态已完美恢复！")
+
             logging.info('✅ 训练状态完全恢复')
         except Exception as e:
-            logging.warning(f'⚠️ 恢复优化器状态失败: {e}')
-
+            logging.warning(f'⚠️ 恢复状态失败: {e}')
     # ============================================================
     # 5. 训练循环
     # ============================================================
@@ -348,89 +380,108 @@ def train_model(
                 with torch.cuda.amp.autocast(enabled=amp):
                     output = model(images)
                     
-                   # -----------------------------------------------------------
-                    # 🔥 修复后的逻辑：自适应处理 2输出 或 3输出
+                    # 🔥🔥🔥 [关键修复] 定义数值截断函数 🔥🔥🔥
+                    # 防止模型输出过大导致 BCE Loss 计算出 NaN
+                    def clamp_logits(x):
+                        return torch.clamp(x, min=-50, max=50)
+
+                    # 初始化 Loss
+                    loss = 0.0
+                    
                     # -----------------------------------------------------------
-                    if isinstance(output, tuple):
-                        # 1. 准备边缘真值 (所有双流模式都需要)
-                        true_edges = generate_edge_tensor(true_masks)
-
-                        if len(output) == 3:
-                            # === [模式 A] MDBES-Net (Seg, Body, Edge) ===
-                            masks_pred, body_pred, edge_pred = output
-                            
-                            # Body GT 计算
-                            true_masks_float = true_masks.unsqueeze(1).float()
-                            true_body = torch.clamp(true_masks_float - true_edges, 0, 1)
-
-                            # 尺寸对齐
+                    # 情况 1: Deep Supervision 模式 (返回列表)
+                    # -----------------------------------------------------------
+                    if isinstance(output, list):
+                        # 🔥 先截断，再计算
+                        pred_final = clamp_logits(output[0])
+                        pred_aux2 = clamp_logits(output[1])
+                        pred_aux3 = clamp_logits(output[2])
+                        
+                        # 1. 主分割 Loss
+                        l_main = calc_loss(pred_final, true_masks, loss_combination, focal_alpha, focal_gamma)
+                        
+                        # 2. 辅助 Loss (需要上采样)
+                        pred_aux2 = F.interpolate(pred_aux2, size=true_masks.shape[1:], mode='bilinear', align_corners=True)
+                        pred_aux3 = F.interpolate(pred_aux3, size=true_masks.shape[1:], mode='bilinear', align_corners=True)
+                        
+                        l_aux2 = calc_loss(pred_aux2, true_masks, loss_combination, focal_alpha, focal_gamma)
+                        l_aux3 = calc_loss(pred_aux3, true_masks, loss_combination, focal_alpha, focal_gamma)
+                        
+                        # 3. 边缘 Loss (如果存在)
+                        l_edge = 0.0
+                        if len(output) > 3:
+                            edge_pred = clamp_logits(output[3]) # 🔥 别忘了截断边缘预测
+                            true_edges = generate_edge_tensor(true_masks)
                             if edge_pred.shape[2:] != true_edges.shape[2:]:
                                 edge_pred = F.interpolate(edge_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
-                                body_pred = F.interpolate(body_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
-
-                            # Loss 计算
-                            l_seg = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
-                            l_body = F.binary_cross_entropy_with_logits(body_pred, true_body)
                             l_edge = F.binary_cross_entropy_with_logits(edge_pred, true_edges, pos_weight=torch.tensor([5.0], device=device))
-                            
-                            loss = l_seg + (lambda_body * l_body) + (lambda_edge * l_edge)
+                        
+                        # 4. 加权求和
+                        loss = l_main + 0.5 * l_aux2 + 0.4 * l_aux3 + (lambda_edge * l_edge)
 
-                        elif len(output) == 2:
-                            # === [模式 B] S-DMFNet (Seg, Aux_Edge) ===
-                            # 🔥 这是你现在需要的逻辑
-                            masks_pred, edge_pred = output
-                            
-                            # 尺寸对齐
-                            if edge_pred.shape[2:] != true_edges.shape[2:]:
-                                edge_pred = F.interpolate(edge_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
-                            
-                            # Loss 计算
-                            # 1. 主分割 Loss (BCE/Dice/Focal)
-                            l_seg = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
-                            
-                            # 2. 辅助边缘 Loss (BCE With Logits)
-                            # 使用辅助头预测的 edge_pred 和生成的 true_edges 进行比较
-                            # pos_weight=5.0 是为了解决边缘像素过少的不平衡问题
-                            l_edge = F.binary_cross_entropy_with_logits(
-                                edge_pred.float(), true_edges.float(), pos_weight=torch.tensor([5.0], device=device)
-                            )
-                            
-                            # 3. 总 Loss
-                            loss = l_seg + (lambda_edge * l_edge)
+                    # -----------------------------------------------------------
+                    # 情况 2: Dual Stream 模式 (返回元组: pred, edge)
+                    # -----------------------------------------------------------
+                    elif isinstance(output, tuple):
+                        # 🔥 严格对应你代码中的双输出逻辑
+                        masks_pred, edge_pred = output
+                        
+                        # 🔥 [关键修复] 立即截断，防止 NaN
+                        masks_pred = clamp_logits(masks_pred)
+                        edge_pred = clamp_logits(edge_pred)
+                        
+                        # 1. 主分割 Loss
+                        l_seg = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
+                        
+                        # 2. 边缘 Loss
+                        true_edges = generate_edge_tensor(true_masks)
+                        if edge_pred.shape[2:] != true_edges.shape[2:]:
+                            edge_pred = F.interpolate(edge_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
+                        l_edge = F.binary_cross_entropy_with_logits(edge_pred, true_edges, pos_weight=torch.tensor([5.0], device=device))
+                        
+                        loss = l_seg + (lambda_edge * l_edge)
 
+                    # -----------------------------------------------------------
+                    # 情况 3: 普通模式 (单输出)
+                    # -----------------------------------------------------------
                     else:
-                        # === [模式 C] 单输出模式 (Seg only) ===
                         masks_pred = output
+                        
+                        # 🔥 [关键修复] 截断
+                        masks_pred = clamp_logits(masks_pred)
+                        
                         loss = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
                         
-                        # 🔥 隐式边缘监督 (Gradient-based Edge Loss)
-                        # 如果没有辅助头，就强迫主分割图的梯度要锐利
+                        # 隐式边缘监督 (Sobel Edge Loss)
                         if lambda_edge > 0:
-                               # ✅ 加个 float() 保平安
-                            loss_e = edge_criterion(masks_pred.float(), true_masks.float()) 
-                            loss += lambda_edge * loss_e
-                    # =================================================================
-                    # 🔥 [新增插入位置] 原型正交 Loss (防止 ProtoFormer 坍塌)
-                    # =================================================================
-                    # 只有当模型里真的有 prototypes 参数时，这个 loss 才有值
-                    # 建议权重 0.01，既能约束原型互斥，又不会干扰主分割任务
-                    lambda_ortho = 0 
-                    ortho_loss = compute_prototype_ortho_loss(model, device=device)
+                            try:
+                                loss_e = edge_criterion(masks_pred.float(), true_masks.float())
+                                loss += lambda_edge * loss_e
+                            except NameError:
+                                pass 
                     
-                    # 将正交 Loss 加到总 Loss 中
-                    loss += lambda_ortho * ortho_loss
-                    # =================================================================
-                     # 🔥 [修改点 1] Loss 归一化
-                     # 如果我们要累计 2 步，那么每步的 Loss 应该除以 2
+                    # -----------------------------------------------------------
+                    # 原型正交 Loss (如果有)
+                    # -----------------------------------------------------------
+                    lambda_ortho = 0.0 
+                    if lambda_ortho > 0:
+                         ortho_loss = compute_prototype_ortho_loss(model, device=device)
+                         loss += lambda_ortho * ortho_loss
+
+                    # -----------------------------------------------------------
+                    # Loss 归一化 (用于梯度累积)
+                    # -----------------------------------------------------------
                     loss = loss / accumulation_steps
+                
                 # 异常检测
                 if torch.isnan(loss) or torch.isinf(loss):
                     logging.error(f'Loss NaN/Inf detected: {loss.item()}. Skipping batch.')
                     optimizer.zero_grad()
                     continue
-                # 反向传播
                 
+                # 反向传播
                 grad_scaler.scale(loss).backward()
+                
                 # 🔥 [修改] 只有达到累计步数，或 epoch 结束时才更新
                 if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
                     grad_scaler.unscale_(optimizer)
@@ -533,6 +584,12 @@ def train_model(
                 'wandb_id': experiment.id,  # 保存身份证号
                 'global_step': global_step, # 保存当前步数
                 # ... 保留你的其他键值
+                # 🔥🔥🔥 [核心补充] 必须保存这 4 个随机状态 🔥🔥🔥
+                'cpu_rng_state': torch.get_rng_state(),              # PyTorch CPU 随机状态
+                'cuda_rng_state': torch.cuda.get_rng_state(),        # PyTorch GPU 随机状态 (单卡用这个)
+                # 'cuda_rng_state': torch.cuda.get_rng_state_all(),  # 如果你是多卡训练，请用这行替换上一行
+                'numpy_rng_state': np.random.get_state(),            # Numpy 随机状态 (影响数据增强)
+                'py_rng_state': random.getstate(),                   # Python 原生随机状态
             }
             
             # Latest
@@ -678,8 +735,9 @@ def get_args():
     parser.add_argument('--accumulation-steps', type=int, default=1, help='Gradient accumulation steps')
 # 🔥 [新增 2] 添加预训练权重开关 (1=加载, 0=不加载)
     parser.add_argument('--pretrained', type=int, default=1, help='Load ImageNet weights? 1=Yes, 0=No')
+    parser.add_argument('--use-deep-supervision', action='store_true', default=False, help='Enable Deep Supervision')
     return parser.parse_args()
-
+ 
 if __name__ == '__main__':
     # 🔥🔥🔥 在这里调用，数字随便填（比如 42, 3407, 2023）
     setup_seed(42)
@@ -722,6 +780,7 @@ if __name__ == '__main__':
         use_unet3p=args.use_unet3p, # 🔥 传入参数
         use_wavelet_denoise=args.use_wavelet_denoise,  # 👈 传入这个参数
         use_mfam=not args.no_mfam, # 注意这里：如果命令行加了 --no-mfam，则 use_mfam=False
+        use_deep_supervision=args.use_deep_supervision, # 🔥 传入参数
           # 🔥 传入 MDBES-Net 解耦参数
     )
     

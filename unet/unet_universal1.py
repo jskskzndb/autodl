@@ -330,7 +330,7 @@ class PHD_DecoderBlock_Pro(nn.Module):
         )
         
         # 2. 原型交互核心 (每层独立拥有 16 个原型)
-        self.proto_block = PrototypeInteractionBlock(out_channels, num_prototypes=8)
+        self.proto_block = PrototypeInteractionBlock(out_channels, num_prototypes=4)
         
     def forward(self, x):
         # 对齐
@@ -366,37 +366,40 @@ class Up_Universal(nn.Module):
 # ================================================================
 # 3. 主模型: UniversalUNet
 # ================================================================
+# [请将此代码覆盖 unet/unet_universal1.py 中的 UniversalUNet 类]
+
 class UniversalUNet(nn.Module):
     def __init__(self, 
                  n_classes=1, 
                  cnext_type='convnextv2_tiny', 
                  pretrained=True,
-                 decoder_type='phd',       # 'phd' or 'standard'
-                 use_dual_stream=True,     # True or False
+                 decoder_type='phd',       
+                 use_dual_stream=True,     
+                 use_deep_supervision=False, # 🔥 [新增] 深层监督开关
                  **kwargs):
         super().__init__()
         self.n_classes = n_classes
         self.use_dual_stream = use_dual_stream
         self.decoder_type = decoder_type
+        self.use_deep_supervision = use_deep_supervision
         
         print(f"🤖 [Universal Model] Initialized with:")
         print(f"   - Encoder: {cnext_type} (Pretrained={pretrained})")
         print(f"   - Dual Stream: {'✅ ON' if use_dual_stream else '❌ OFF'}")
-        print(f"   - Decoder: {'🏆 PHD Pro' if decoder_type=='phd' else '🔹 Standard UNet'}")
+        print(f"   - Decoder: ProtoFormer (Prototype Interaction)")
+        print(f"   - Deep Supervision: {'✅ ON' if use_deep_supervision else '❌ OFF'}")
 
         # 1. Spatial Encoder
         self.spatial_encoder = timm.create_model(cnext_type, pretrained=pretrained, features_only=True, out_indices=(0, 1, 2, 3), drop_path_rate=0.0)
         s_dims = self.spatial_encoder.feature_info.channels()
         c1, c2, c3, c4 = s_dims
 
-        # 2. Frequency Encoder & Bi-FGF (Only if Dual Stream)
+        # 2. Frequency Encoder & Bi-FGF (保持原样)
         if self.use_dual_stream:
             f_dims = [c // 4 for c in s_dims]
             self.freq_stem = nn.Sequential(nn.Conv2d(3, f_dims[0], 4, stride=4, padding=0), nn.BatchNorm2d(f_dims[0]), nn.ReLU(True))
             self.freq_layers = nn.ModuleList([WaveletMambaBlock(f_dims[i], f_dims[i+1]) for i in range(3)])
             self.bi_fgf_modules = nn.ModuleList([Cross_GL_FGF(s_dims[i], f_dims[i]) for i in range(4)])
-            
-            # 辅助边缘头 (只在双流时有意义)
             self.edge_head = nn.Sequential(nn.Conv2d(f_dims[0], 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(True), nn.Conv2d(64, 1, 1))
 
         # 3. Decoder
@@ -406,12 +409,29 @@ class UniversalUNet(nn.Module):
         
         self.final_up = nn.Upsample(scale_factor=4, mode='bilinear', align_corners=True)
         self.outc = nn.Conv2d(c1, n_classes, kernel_size=1)
+        
+        # 🔥 [新增] 辅助分类头 (Auxiliary Heads)
+        if self.use_deep_supervision:
+            # UP2 输出通道数是 c2 (例如 192)
+            self.head_up2 = nn.Sequential(
+                nn.Conv2d(c2, 64, kernel_size=3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, n_classes, kernel_size=1)
+            )
+            # UP3 输出通道数是 c1 (例如 96)
+            self.head_up3 = nn.Sequential(
+                nn.Conv2d(c1, 64, kernel_size=3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, n_classes, kernel_size=1)
+            )
 
     def forward(self, x):
         # 1. Encoder Pass
         s_feats = list(self.spatial_encoder(x))
         
-        # 2. Dual Stream & Interaction Pass
+        # 2. Dual Stream Pass
         edge_logits = None
         if self.use_dual_stream:
             f_curr = self.freq_stem(x)
@@ -421,30 +441,42 @@ class UniversalUNet(nn.Module):
                 f_feats.append(f_inter)
                 f_curr = f_next
             
-            # Interaction
             s_fused_list = []
             f_enhanced_list = []
             for i in range(4):
                 s_out, f_out = self.bi_fgf_modules[i](s_feats[i], f_feats[i])
                 s_fused_list.append(s_out)
                 f_enhanced_list.append(f_out)
-            
-            # Update s_feats with fused features
             s_feats = s_fused_list
             
-            # Edge Head
             if self.training:
                 edge_small = self.edge_head(f_enhanced_list[0])
                 edge_logits = F.interpolate(edge_small, size=x.shape[2:], mode='bilinear', align_corners=True)
 
-        # 3. Decoder Pass (s_feats 可能是原始的，也可能是融合过的)
+        # 3. Decoder Pass
         s1, s2, s3, s4 = s_feats
-        d1 = self.up1(s4, s3)
-        d2 = self.up2(d1, s2)
-        d3 = self.up3(d2, s1)
         
+        d1 = self.up1(s4, s3) # 最小尺度
+        d2 = self.up2(d1, s2) # 中间尺度 1
+        d3 = self.up3(d2, s1) # 中间尺度 2
+        
+        # 主输出
         logits = self.outc(self.final_up(d3))
         
+        # 🔥 [修改] 返回逻辑
+        if self.training and self.use_deep_supervision:
+            # 计算辅助输出
+            aux2 = self.head_up2(d2)
+            aux3 = self.head_up3(d3)
+            
+            # 返回列表: [Main, Aux2, Aux3, (Optional Edge)]
+            outputs = [logits, aux2, aux3]
+            if self.use_dual_stream and edge_logits is not None:
+                outputs.append(edge_logits)
+            return outputs
+        
+        # 保持原有兼容
         if self.training and self.use_dual_stream and edge_logits is not None:
             return logits, edge_logits
+            
         return logits
