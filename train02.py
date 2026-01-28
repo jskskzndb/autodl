@@ -595,7 +595,7 @@ def train_model(
             # Latest
             torch.save(checkpoint, str(dir_checkpoint / 'checkpoint_latest.pth'))
             # 2. 🔥 [修改点 2] 30轮以后，每一轮都额外保存一个文件
-            if epoch > 80:
+            if epoch > 50:
                 # 文件名例如: checkpoint_epoch_31.pth, checkpoint_epoch_32.pth ...
                 epoch_path = str(dir_checkpoint / f'checkpoint_epoch_{epoch}.pth')
                 torch.save(checkpoint, epoch_path)

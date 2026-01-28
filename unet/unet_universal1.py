@@ -385,6 +385,9 @@ class UniversalUNet(nn.Module):
                  use_deep_supervision=False, # 🔥 [新增] 深层监督开关
                  **kwargs):
         super().__init__()
+        # 🔥🔥🔥 [修复点] 兼容性处理: 如果 kwargs 里有 decoder_name，优先使用它覆盖 decoder_type
+        if 'decoder_name' in kwargs and kwargs['decoder_name'] is not None:
+            decoder_type = kwargs['decoder_name']
         self.n_classes = n_classes
         self.use_dual_stream = use_dual_stream
         self.decoder_type = decoder_type
