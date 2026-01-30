@@ -140,7 +140,60 @@ class WindowAttention(nn.Module):
         
         # Crop Padding
         return x_out[:, :, :H, :W]
+# ================================================================
+# 新增模块: ASPP (Atrous Spatial Pyramid Pooling)
+# 作用: 增加感受野，显著增加有效参数量 (针对策略2)
+# ================================================================
+class ASPP(nn.Module):
+    def __init__(self, in_channels, out_channels, atrous_rates=[6, 12, 18]):
+        super(ASPP, self).__init__()
+        modules = []
+        
+        # 1. 分支1: 1x1 卷积
+        modules.append(nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)))
 
+        # 2. 分支2-4: 不同扩张率的 3x3 空洞卷积
+        for rate in atrous_rates:
+            modules.append(nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding=rate, dilation=rate, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)))
+
+        self.aspp_blocks = nn.ModuleList(modules)
+        
+        # 3. 分支5: 全局平均池化 (Image Pooling)
+        self.global_avg_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True))
+
+        # 4. 融合投影层
+        # 输入通道数 = 5 个分支 * out_channels
+        self.project = nn.Sequential(
+            nn.Conv2d(out_channels * (len(atrous_rates) + 2), out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1) # 防止过拟合
+        )
+
+    def forward(self, x):
+        res = []
+        # 计算卷积分支
+        for block in self.aspp_blocks:
+            res.append(block(x))
+        
+        # 计算池化分支并上采样
+        res.append(F.interpolate(self.global_avg_pool(x), size=x.shape[2:], mode='bilinear', align_corners=True))
+        
+        # 拼接
+        res = torch.cat(res, dim=1)
+        
+        # 融合输出
+        return self.project(res)
 # ================================================================
 # 1. 核心模块: SFDA Block (替代 WaveletMambaBlock)
 # ================================================================
@@ -376,7 +429,10 @@ class UniversalUNet(nn.Module):
             
             self.bi_fgf_modules = nn.ModuleList([Cross_GL_FGF(s_dims[i], f_dims[i]) for i in range(4)])
             self.edge_head = nn.Sequential(nn.Conv2d(f_dims[0], 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(True), nn.Conv2d(64, 1, 1))
-
+# 🔥🔥🔥 [新增修改] 策略2: 定义语义桥梁 ASPP 🔥🔥🔥
+        # 放在 Encoder 最深层 (s_dims[3]=768) 之后
+        # 输入输出保持一致，只为了提取特征和增加参数
+        self.bridge = ASPP(in_channels=s_dims[3], out_channels=s_dims[3])
         # 3. Decoder
         self.up1 = Up_Universal(s_dims[3], s_dims[2], skip_channels=s_dims[2], decoder_type=decoder_type)
         self.up2 = Up_Universal(s_dims[2], s_dims[1], skip_channels=s_dims[1], decoder_type=decoder_type)
@@ -426,7 +482,10 @@ class UniversalUNet(nn.Module):
             if self.training:
                 edge_small = self.edge_head(f_enhanced_list[0])
                 edge_logits = F.interpolate(edge_small, size=x.shape[2:], mode='bilinear', align_corners=True)
-
+# 🔥🔥🔥 [新增修改] 策略2: 在进入解码器之前，先过桥 🔥🔥🔥
+        # s_feats[3] 是最深层语义特征 (H/32)
+        # 通过 ASPP 增强其全局感受野
+        s_feats[3] = self.bridge(s_feats[3])
         # 3. Decoder Pass
         s1, s2, s3, s4 = s_feats
         

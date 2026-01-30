@@ -485,8 +485,24 @@ def train_model(
                 # 🔥 [修改] 只有达到累计步数，或 epoch 结束时才更新
                 if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
                     grad_scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
-                    epoch_grad_norms.append(grad_norm.item())
+                     # 🔥 [新增] 严格的梯度检查：如果梯度有 inf/nan，直接跳过这一步更新
+                    grad_is_valid = True
+                    for param in model.parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                grad_is_valid = False
+                                break
+                    
+                    if not grad_is_valid:
+                        logging.warning(f"⚠️ Epoch {epoch} Step {i}: Gradient Explosion detected (Inf/NaN). Skipping step.")
+                        optimizer.zero_grad() # 丢弃这次的梯度
+                        # 不做 step，也不做 update
+                    else:
+                        # 2.2 梯度裁剪 (Clip Gradient Norm)
+                        # 🔥 [建议] 把 max_norm 从 1.0 降低到 0.5 或 0.1，对 Transformer 结构更稳
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                        
+                        epoch_grad_norms.append(grad_norm.item())
 
                     grad_scaler.step(optimizer)
                     grad_scaler.update()
