@@ -58,5 +58,9 @@
 #功能: 一个类实现 4 种架构组合，通过参数控制。+ASPP
 #from .unet_universal2 import UniversalUNet as UNet
 #🟢 全能型 UNet
+#功能: 一个类实现 4 种架构组合，通过参数控制。PHD×2
+#from .unet_universal3 import UniversalUNet as UNet
+
+#🟢 全能型 UNet
 #功能: 一个类实现 4 种架构组合，通过参数控制。PHD×3
-from .unet_universal3 import UniversalUNet as UNet
+from .unet_universal4 import UniversalUNet as UNet
