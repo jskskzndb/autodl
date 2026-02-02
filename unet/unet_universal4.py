@@ -315,7 +315,7 @@ class PHD_DecoderBlock_Pro(nn.Module):
         self.gamma_ffn = nn.Parameter(torch.ones(depth, out_channels) * 1e-5)
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                PrototypeInteractionBlock(out_channels, num_prototypes=16),
+                PrototypeInteractionBlock(out_channels, num_prototypes=8),
                 FeedForward(out_channels, out_channels * 4)
             ]))
 

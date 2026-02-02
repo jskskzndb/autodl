@@ -16,7 +16,7 @@ import cv2
 from evaluate import evaluate, threshold_scan_evaluate
 from utils.data_loading import BasicDataset
 from utils.dice_score import dice_loss
-
+import csv
 from timm.scheduler import CosineLRScheduler  # 🔥 [新增 1] 添加这一行
 from utils.losses import FocalLoss, CombinedLoss, DiceLossOnly, EdgeLoss, compute_prototype_ortho_loss
 from utils.utils import log_grad_stats
@@ -24,7 +24,32 @@ from utils.utils import log_grad_stats
 from unet import UNet
 
 import random
+import csv
+import os
 
+class MetricLogger:
+    def __init__(self, save_path):
+        self.save_path = save_path
+        # 初始化 CSV 文件，如果文件不存在则写入表头
+        if not os.path.exists(self.save_path):
+            with open(self.save_path, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Epoch', 'Train_Loss', 'Val_Loss', 'Dice', 'Precision', 'Recall', 'F1', 'IoU', 'LR'])
+
+    def log(self, epoch, train_loss, val_metrics, lr):
+        with open(self.save_path, mode='a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch,
+                f"{train_loss:.4f}",
+                f"{val_metrics['loss']:.4f}",
+                f"{val_metrics['dice']:.4f}",
+                f"{val_metrics['precision']:.4f}",
+                f"{val_metrics['recall']:.4f}",
+                f"{val_metrics['f1']:.4f}",
+                f"{val_metrics['iou']:.4f}",
+                f"{lr:.8f}"
+            ])
 def setup_seed(seed):
     import random
     import numpy as np
@@ -218,6 +243,11 @@ def train_model(
         run_id = checkpoint_to_load['wandb_id']
         logging.info(f"🔗 检测到 WandB ID: {run_id}，正在恢复连接...")
     experiment = wandb.init(project='U-Net', resume='allow', anonymous='must', id=run_id)
+    # 🔥 [新增] 初始化本地 CSV Logger
+# 建议保存在 checkpoints 目录下，或者你指定的目录
+    csv_log_path = dir_checkpoint / "training_metrics.csv"
+    csv_logger = MetricLogger(csv_log_path)
+    logging.info(f"📊 本地指标记录器已就绪: {csv_log_path}")
     experiment.config.update(dict(
         epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
         img_scale=img_scale, amp=amp, backbone_lr=backbone_lr_scale
@@ -581,7 +611,8 @@ def train_model(
             'epoch': epoch,                        # 🔥 新增: 当前轮次
             'train/learning_rate': current_lr      # 🔥 新增: 当前学习率曲线
         })
-
+        # 🔥 [新增] 同时写入本地 CSV 文件
+        csv_logger.log(epoch, avg_epoch_loss, val_metrics, current_lr)
         
 
         # ====== 保存 Checkpoint ======
