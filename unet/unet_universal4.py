@@ -1,12 +1,13 @@
 """
-unet/unet_universal1.py
-[Universal Model] 全能型 UNet (Heavy Decoder Version)
+unet/unet_universal3.py
+[Universal Model] 全能型 UNet (Heavy Decoder Version + Body-Edge Decoupling)
 架构特点:
   1. Spatial Encoder: ConvNeXt V2 (语义提取)
   2. Frequency Encoder: SFDA Block (Hi-Lo Attention, FP32 Protected)
   3. Interaction: Bi-FGF (双向门控融合)
   4. Decoder: Heavy ProtoFormer (3级级联交互，参数量增强)
   5. Deep Supervision: 支持多尺度辅助监督
+  6. Decoupling: 体-缘解耦双解码器 (Body Stream + Edge Stream -> Fusion)
 """
 
 import torch
@@ -315,7 +316,7 @@ class PHD_DecoderBlock_Pro(nn.Module):
         self.gamma_ffn = nn.Parameter(torch.ones(depth, out_channels) * 1e-5)
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
-                PrototypeInteractionBlock(out_channels, num_prototypes=8),
+                PrototypeInteractionBlock(out_channels, num_prototypes=16),
                 FeedForward(out_channels, out_channels * 4)
             ]))
 
@@ -351,7 +352,7 @@ class Up_Universal(nn.Module):
         return self.conv(x)
 
 # ================================================================
-# 4. 主模型: UniversalUNet (最终组装)
+# 4. 主模型: UniversalUNet (最终组装 + Decoupling)
 # ================================================================
 class UniversalUNet(nn.Module):
     def __init__(self, 
@@ -361,17 +362,20 @@ class UniversalUNet(nn.Module):
                  decoder_type='phd',       
                  use_dual_stream=True,     
                  use_deep_supervision=False,
+                 use_decouple=False, # 🔥 [新参数] 默认关闭
                  **kwargs):
         super().__init__()
         self.n_classes = n_classes
         self.use_dual_stream = use_dual_stream
         self.decoder_type = decoder_type
         self.use_deep_supervision = use_deep_supervision
+        self.use_decouple = use_decouple
         
         print(f"🤖 [Universal Model] Initialized with:")
         print(f"   - Encoder: {cnext_type}")
         print(f"   - Dual Stream (SFDA): {'✅ ON' if use_dual_stream else '❌ OFF'}")
         print(f"   - Decoder: Heavy ProtoFormer (Depth=3)")
+        print(f"   - Body-Edge Decoupling: {'✅ ON' if use_decouple else '❌ OFF'}")
         
         # 1. Spatial Encoder
         self.spatial_encoder = timm.create_model(cnext_type, pretrained=pretrained, features_only=True, out_indices=(0, 1, 2, 3), drop_path_rate=0.0)
@@ -397,7 +401,31 @@ class UniversalUNet(nn.Module):
         self.up3 = Up_Universal(s_dims[1], s_dims[0], skip_channels=s_dims[0], decoder_type=decoder_type)
         
         self.final_up = nn.Upsample(scale_factor=4, mode='bilinear', align_corners=True)
-        self.outc = nn.Conv2d(s_dims[0], n_classes, kernel_size=1)
+        
+        # 🔥🔥🔥 [修改区域: 解耦头] 🔥🔥🔥
+        final_dim = s_dims[0]
+        if self.use_decouple:
+            # A. Body Head (预测实体)
+            self.body_head = nn.Sequential(
+                nn.Conv2d(final_dim, 64, 3, padding=1, bias=False),
+                nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+                nn.Conv2d(64, n_classes, 1)
+            )
+            # B. Edge Head (预测边缘)
+            self.edge_head_decouple = nn.Sequential(
+                nn.Conv2d(final_dim, 64, 3, padding=1, bias=False),
+                nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+                nn.Conv2d(64, n_classes, 1)
+            )
+            # C. Fusion Head (融合)
+            self.fusion_head = nn.Sequential(
+                nn.Conv2d(n_classes * 2, 64, 3, padding=1, bias=False),
+                nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+                nn.Conv2d(64, n_classes, 1)
+            )
+        else:
+            # 传统单输出
+            self.outc = nn.Conv2d(s_dims[0], n_classes, kernel_size=1)
         
         # 4. Deep Supervision
         if self.use_deep_supervision:
@@ -432,17 +460,40 @@ class UniversalUNet(nn.Module):
         d2 = self.up2(d1, s_feats[1])
         d3 = self.up3(d2, s_feats[0])
         
-        logits = self.outc(self.final_up(d3))
+        # 解码器最终特征
+        dec_feat = self.final_up(d3)
         
-        if self.training and self.use_deep_supervision:
-            aux2 = self.head_up2(d2)
-            aux3 = self.head_up3(d3)
-            outputs = [logits, aux2, aux3]
+        # 🔥🔥🔥 [修改区域: 解耦前向传播] 🔥🔥🔥
+        if self.use_decouple:
+            # 1. 独立预测 Body 和 Edge
+            body_out = self.body_head(dec_feat)
+            edge_out = self.edge_head_decouple(dec_feat)
+            
+            # 2. 拼接并融合得到最终结果
+            cat_feat = torch.cat([body_out, edge_out], dim=1)
+            final_out = self.fusion_head(cat_feat)
+        else:
+            final_out = self.outc(dec_feat)
+            
+        # 返回逻辑
+        if self.training:
+            outputs = [final_out]
+            
+            # Deep Supervision
+            if self.use_deep_supervision:
+                aux2 = self.head_up2(d2)
+                aux3 = self.head_up3(d3)
+                outputs.extend([aux2, aux3])
+            
+            # Decouple Outputs (为了计算 Loss)
+            if self.use_decouple:
+                outputs.extend([body_out, edge_out])
+
+            # Dual Stream Legacy Edge
             if self.use_dual_stream and edge_logits is not None:
                 outputs.append(edge_logits)
-            return outputs
-        
-        if self.training and self.use_dual_stream and edge_logits is not None:
-            return logits, edge_logits
             
-        return logits
+            # 如果是单输出模式且无其他 head，直接返回 tensor
+            return outputs if len(outputs) > 1 else final_out
+            
+        return final_out
