@@ -111,7 +111,7 @@ def get_args():
     parser.add_argument('--use-edge-loss', action='store_true', default=False)
     parser.add_argument('--wgn-base-order', type=int, default=3)
     parser.add_argument('--wgn-orders', type=str, default=None)
-
+    parser.add_argument('--use-sparse-skip', action='store_true', default=False, help='Enable Wavelet Skip Refiner in Skip Connections')
     return parser.parse_args()
 
 def extract_epoch(filename):
@@ -181,7 +181,8 @@ def main():
         n_classes=args.classes,
         bilinear=args.bilinear,
         encoder_name=args.encoder,
-        decoder_name=args.decoder,
+        
+        decoder_type=args.decoder,  # <--- 加上这一行！
         cnext_type=args.cnext_type,
         use_wgn_enhancement=args.use_wgn_enhancement,
         use_cafm=args.use_cafm,
@@ -194,7 +195,9 @@ def main():
         use_dual_stream=args.use_dual_stream,
         use_unet3p=args.use_unet3p,
         use_wavelet_denoise=args.use_wavelet_denoise,
-        use_deep_supervision=args.use_deep_supervision
+        use_deep_supervision=args.use_deep_supervision,
+        # 🔥🔥🔥 [关键修改] 传入这个参数！ 🔥🔥🔥
+        use_sparse_skip=args.use_sparse_skip
     )
     model.to(device)
 

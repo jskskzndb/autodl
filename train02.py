@@ -413,94 +413,53 @@ def train_model(
                     # 🔥🔥🔥 [关键修复] 定义数值截断函数 🔥🔥🔥
                     # 防止模型输出过大导致 BCE Loss 计算出 NaN
                     def clamp_logits(x):
-                        return torch.clamp(x, min=-50, max=50)
+                        return torch.clamp(x, min=-20, max=20)
 
                     # 初始化 Loss
+                    # 🔥🔥🔥 [修复] 动态 Loss 计算，完美兼容“无深度监督” 🔥🔥🔥
+                    # ============================================================
                     loss = 0.0
                     
-                    # -----------------------------------------------------------
-                    # 情况 1: Deep Supervision 模式 (返回列表)
-                    # -----------------------------------------------------------
-                    if isinstance(output, list):
-                        # 🔥 先截断，再计算
-                        pred_final = clamp_logits(output[0])
-                        pred_aux2 = clamp_logits(output[1])
-                        pred_aux3 = clamp_logits(output[2])
-                        
-                        # 1. 主分割 Loss
-                        l_main = calc_loss(pred_final, true_masks, loss_combination, focal_alpha, focal_gamma)
-                        
-                        # 2. 辅助 Loss (需要上采样)
-                        pred_aux2 = F.interpolate(pred_aux2, size=true_masks.shape[1:], mode='bilinear', align_corners=True)
-                        pred_aux3 = F.interpolate(pred_aux3, size=true_masks.shape[1:], mode='bilinear', align_corners=True)
-                        
-                        l_aux2 = calc_loss(pred_aux2, true_masks, loss_combination, focal_alpha, focal_gamma)
-                        l_aux3 = calc_loss(pred_aux3, true_masks, loss_combination, focal_alpha, focal_gamma)
-                        
-                        # 3. 边缘 Loss (如果存在)
-                        l_edge = 0.0
-                        if len(output) > 3:
-                            edge_pred = clamp_logits(output[3]) # 🔥 别忘了截断边缘预测
-                            true_edges = generate_edge_tensor(true_masks)
-                            if edge_pred.shape[2:] != true_edges.shape[2:]:
-                                edge_pred = F.interpolate(edge_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
-                            l_edge = F.binary_cross_entropy_with_logits(edge_pred, true_edges, pos_weight=torch.tensor([5.0], device=device))
-                        
-                        # 4. 加权求和
-                        loss = l_main + 0.5 * l_aux2 + 0.4 * l_aux3 + (lambda_edge * l_edge)
-
-                    # -----------------------------------------------------------
-                    # 情况 2: Dual Stream 模式 (返回元组: pred, edge)
-                    # -----------------------------------------------------------
-                    elif isinstance(output, tuple):
-                        # 🔥 严格对应你代码中的双输出逻辑
-                        masks_pred, edge_pred = output
-                        
-                        # 🔥 [关键修复] 立即截断，防止 NaN
-                        masks_pred = clamp_logits(masks_pred)
-                        edge_pred = clamp_logits(edge_pred)
-                        
-                        # 1. 主分割 Loss
-                        l_seg = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
-                        
-                        # 2. 边缘 Loss
-                        true_edges = generate_edge_tensor(true_masks)
-                        if edge_pred.shape[2:] != true_edges.shape[2:]:
-                            edge_pred = F.interpolate(edge_pred, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
-                        l_edge = F.binary_cross_entropy_with_logits(edge_pred, true_edges, pos_weight=torch.tensor([5.0], device=device))
-                        
-                        loss = l_seg + (lambda_edge * l_edge)
-
-                    # -----------------------------------------------------------
-                    # 情况 3: 普通模式 (单输出)
-                    # -----------------------------------------------------------
-                    else:
-                        masks_pred = output
-                        
-                        # 🔥 [关键修复] 截断
-                        masks_pred = clamp_logits(masks_pred)
-                        
-                        loss = calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma)
-                        
-                        # 隐式边缘监督 (Sobel Edge Loss)
-                        if lambda_edge > 0:
-                            try:
-                                loss_e = edge_criterion(masks_pred.float(), true_masks.float())
-                                loss += lambda_edge * loss_e
-                            except NameError:
-                                pass 
+                    # 1. 统一转为 List
+                    if not isinstance(output, (list, tuple)):
+                        output = [output]
                     
-                    # -----------------------------------------------------------
-                    # 原型正交 Loss (如果有)
-                    # -----------------------------------------------------------
-                    lambda_ortho = 0.0 
-                    if lambda_ortho > 0:
-                         ortho_loss = compute_prototype_ortho_loss(model, device=device)
-                         loss += lambda_ortho * ortho_loss
+                    # 游标 (Cursor)
+                    current_idx = 0
+                    
+                    # A. 主 Loss
+                    pred_main = clamp_logits(output[current_idx])
+                    loss += calc_loss(pred_main, true_masks, loss_combination, focal_alpha, focal_gamma)
+                    current_idx += 1
 
-                    # -----------------------------------------------------------
-                    # Loss 归一化 (用于梯度累积)
-                    # -----------------------------------------------------------
+                    # B. 深监督 Loss (只有开启了 Deep Supervision 且返回了足够多的输出才算)
+                    if hasattr(model, 'use_deep_supervision') and model.use_deep_supervision:
+                        if current_idx + 1 < len(output):
+                            pred_aux2 = clamp_logits(output[current_idx])
+                            pred_aux3 = clamp_logits(output[current_idx+1])
+                            
+                            pred_aux2 = F.interpolate(pred_aux2, size=true_masks.shape[1:], mode='bilinear', align_corners=True)
+                            pred_aux3 = F.interpolate(pred_aux3, size=true_masks.shape[1:], mode='bilinear', align_corners=True)
+                            
+                            l_aux2 = calc_loss(pred_aux2, true_masks, loss_combination, focal_alpha, focal_gamma)
+                            l_aux3 = calc_loss(pred_aux3, true_masks, loss_combination, focal_alpha, focal_gamma)
+                            
+                            loss += 0.5 * l_aux2 + 0.4 * l_aux3
+                            current_idx += 2
+                    
+                    # C. 双流边缘 Loss (只要开了双流，剩下的那个就是 Edge)
+                    if hasattr(model, 'use_dual_stream') and model.use_dual_stream:
+                        if current_idx < len(output):
+                            pred_edge = clamp_logits(output[current_idx])
+                            true_edges = generate_edge_tensor(true_masks)
+                            
+                            if pred_edge.shape[2:] != true_edges.shape[2:]:
+                                pred_edge = F.interpolate(pred_edge, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
+                            
+                            l_edge = F.binary_cross_entropy_with_logits(pred_edge, true_edges, pos_weight=torch.tensor([5.0], device=device))
+                            loss += lambda_edge * l_edge
+                            current_idx += 1
+                    # ============================================================
                     loss = loss / accumulation_steps
                 
                 # 异常检测
@@ -642,7 +601,7 @@ def train_model(
             # Latest
             torch.save(checkpoint, str(dir_checkpoint / 'checkpoint_latest.pth'))
             # 2. 🔥 [修改点 2] 30轮以后，每一轮都额外保存一个文件
-            if epoch > 50:
+            if epoch > 30:
                 # 文件名例如: checkpoint_epoch_31.pth, checkpoint_epoch_32.pth ...
                 epoch_path = str(dir_checkpoint / f'checkpoint_epoch_{epoch}.pth')
                 torch.save(checkpoint, epoch_path)
@@ -783,6 +742,8 @@ def get_args():
 # 🔥 [新增 2] 添加预训练权重开关 (1=加载, 0=不加载)
     parser.add_argument('--pretrained', type=int, default=1, help='Load ImageNet weights? 1=Yes, 0=No')
     parser.add_argument('--use-deep-supervision', action='store_true', default=False, help='Enable Deep Supervision')
+    # 🔥🔥🔥 [新增] 注册 --use-sparse-skip 参数 🔥🔥🔥
+    parser.add_argument('--use-sparse-skip', action='store_true', default=False, help='Enable Wavelet Skip Refiner in Skip Connections')
     return parser.parse_args()
  
 if __name__ == '__main__':
@@ -828,6 +789,8 @@ if __name__ == '__main__':
         use_wavelet_denoise=args.use_wavelet_denoise,  # 👈 传入这个参数
         use_mfam=not args.no_mfam, # 注意这里：如果命令行加了 --no-mfam，则 use_mfam=False
         use_deep_supervision=args.use_deep_supervision, # 🔥 传入参数
+        # 🔥🔥🔥 [关键修改] 传入参数给模型 🔥🔥🔥
+        use_sparse_skip=args.use_sparse_skip,
           # 🔥 传入 MDBES-Net 解耦参数
     )
     

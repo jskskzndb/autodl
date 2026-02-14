@@ -1,5 +1,5 @@
 # test01.py (适配 DCNv3 / D-UBM)
-
+from utils.metrics_distance import compute_hd95, compute_asd
 import argparse
 import logging
 import os
@@ -24,7 +24,13 @@ def test_model(
 ):
     net.eval()
     num_test_batches = len(test_loader)
+    
+    # 计数器
     total_tp = 0; total_fp = 0; total_fn = 0
+    
+    # 🔥 新增：用于存储每张图的距离指标
+    hd95_scores = []
+    asd_scores = []
 
     if save_predictions:
         os.makedirs(output_dir, exist_ok=True)
@@ -32,22 +38,22 @@ def test_model(
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(enabled=amp):
+            # 注意：tqdm 显示进度条
             for i, batch in enumerate(tqdm(test_loader, total=num_test_batches, desc='Testing', unit='batch')):
                 images, true_masks = batch['image'], batch['mask']
                 images = images.to(device, dtype=torch.float32, memory_format=torch.channels_last)
                 true_masks = true_masks.to(device, dtype=torch.long)
 
-                # 🔥 推理
+                # --- 模型推理 ---
                 output = net(images)
                 
-                # 🔥 [兼容性处理]
-                # S-DMFNet 在 eval 模式下通常只返回 logits (Tensor)
-                # 但为了防止某些变体返回 (logits, edge_logits)，这里保留兼容逻辑
+                # 兼容性处理：如果模型返回 tuple (logits, edges)，只取 logits
                 if isinstance(output, tuple):
                     masks_pred = output[0]
                 else:
                     masks_pred = output
 
+                # 钳制数值防止溢出
                 masks_pred = torch.clamp(masks_pred, min=-50, max=50)
 
                 if net.n_classes == 1:
@@ -55,6 +61,7 @@ def test_model(
                     pred_binary = (pred_probs > threshold).float()
                     true_binary = true_masks.float()
 
+                    # --- 1. 计算 Dice/IoU (基于整个 Batch 累加) ---
                     p_flat = pred_binary.view(-1)
                     t_flat = true_binary.view(-1)
                     
@@ -62,6 +69,26 @@ def test_model(
                     total_fp += (p_flat * (1 - t_flat)).sum()
                     total_fn += ((1 - p_flat) * t_flat).sum()
 
+                    # --- 2. 🔥🔥🔥 新增：逐张计算 HD95 和 ASD 🔥🔥🔥 ---
+                    # 必须把 Batch 拆开，一张张转成 numpy 算
+                    batch_size = pred_binary.shape[0]
+                    for b in range(batch_size):
+                        # 转为 numpy uint8 (0, 1) [H, W]
+                        # .cpu().numpy() 会把数据从 GPU 拉回 CPU
+                        pred_np = pred_binary[b].squeeze().cpu().numpy().astype(np.uint8)
+                        gt_np = true_binary[b].squeeze().cpu().numpy().astype(np.uint8)
+                        
+                        # 计算距离指标
+                        hd95_val = compute_hd95(pred_np, gt_np)
+                        asd_val = compute_asd(pred_np, gt_np)
+                        
+                        # 排除计算失败的情况 (np.nan)
+                        if not np.isnan(hd95_val):
+                            hd95_scores.append(hd95_val)
+                        if not np.isnan(asd_val):
+                            asd_scores.append(asd_val)
+
+                    # --- 3. 保存图片 ---
                     if save_predictions:
                         start_idx = i * test_loader.batch_size
                         for j in range(pred_binary.shape[0]):
@@ -72,14 +99,27 @@ def test_model(
                                 pred_mask_img = Image.fromarray(pred_mask_np)
                                 pred_mask_img.save(os.path.join(output_dir, f'{file_id}_pred.png'))
 
-    # 计算指标
+    # --- 汇总结果 ---
     dice = (2 * total_tp + _EPS) / (2 * total_tp + total_fp + total_fn + _EPS)
     iou = (total_tp + _EPS) / (total_tp + total_fp + total_fn + _EPS)
     precision = (total_tp + _EPS) / (total_tp + total_fp + _EPS)
     recall = (total_tp + _EPS) / (total_tp + total_fn + _EPS)
     f1 = (2 * precision * recall + _EPS) / (precision + recall + _EPS)
 
-    return {'dice': float(dice), 'iou': float(iou), 'precision': float(precision), 'recall': float(recall), 'f1': float(f1)}
+    # 🔥 计算距离指标的平均值
+    avg_hd95 = np.mean(hd95_scores) if len(hd95_scores) > 0 else 0.0
+    avg_asd = np.mean(asd_scores) if len(asd_scores) > 0 else 0.0
+
+    # 返回字典中加入新指标
+    return {
+        'dice': float(dice), 
+        'iou': float(iou), 
+        'precision': float(precision), 
+        'recall': float(recall), 
+        'f1': float(f1),
+        'hd95': float(avg_hd95),  # 越低越好
+        'asd': float(avg_asd)     # 越低越好
+    }
 
 def get_args():
     parser = argparse.ArgumentParser(description='Test Unified UNet')
@@ -119,7 +159,7 @@ def get_args():
     # WGN 参数
     parser.add_argument('--wgn-base-order', type=int, default=3)
     parser.add_argument('--wgn-orders', type=str, default=None)
-
+    parser.add_argument('--use-sparse-skip', action='store_true', default=False, help='Enable Wavelet Skip Refiner in Skip Connections')
     return parser.parse_args()
 
 if __name__ == '__main__':
@@ -151,7 +191,7 @@ if __name__ == '__main__':
         n_classes=args.classes,
         bilinear=args.bilinear,
         encoder_name=args.encoder,
-        decoder_name=args.decoder,
+        decoder_type=args.decoder,  # <--- 🔥🔥🔥 必须加上这一行！
         cnext_type=args.cnext_type,
         use_wgn_enhancement=args.use_wgn_enhancement,
         use_cafm=args.use_cafm,
@@ -165,7 +205,9 @@ if __name__ == '__main__':
         use_dual_stream=args.use_dual_stream,  # 🔥 传入双流开关
         use_unet3p=args.use_unet3p,        # 补上
         use_wavelet_denoise=args.use_wavelet_denoise,
-        use_deep_supervision=args.use_deep_supervision
+        use_deep_supervision=args.use_deep_supervision,
+        # 🔥🔥🔥 [关键修改] 传入这个参数！ 🔥🔥🔥
+        use_sparse_skip=args.use_sparse_skip
     )
 
     # 2. 加载权重

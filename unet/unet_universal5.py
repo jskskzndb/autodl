@@ -51,6 +51,48 @@ class InverseHaarWaveletTransform(nn.Module):
         x = torch.cat([ll, lh, hl, hh], dim=1)
         return F.conv_transpose2d(x, self.filters.repeat(C, 1, 1, 1), stride=2, groups=C)
 
+
+# ================================================================
+# [新增] SCSE 模块 (Spatial & Channel Squeeze Excitation)
+# 作用: 稳健的跳跃连接增强，带残差结构，防止掉点
+# ================================================================
+class SCSEModule(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        # 1. 空间分支 (Spatial cSE) - 关注"在哪里" (边缘)
+        self.spatial_se = nn.Sequential(
+            nn.Conv2d(channels, 1, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.Sigmoid()
+        )
+        
+        # 2. 通道分支 (Channel sSE) - 关注"是什么" (语义)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.channel_se = nn.Sequential(
+            nn.Linear(channels, max(1, channels // reduction), bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(max(1, channels // reduction), channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # x: [B, C, H, W]
+        
+        # --- 分支 1: 空间注意力 ---
+        s_attn = self.spatial_se(x)
+        x_spatial = x * s_attn
+        
+        # --- 分支 2: 通道注意力 ---
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        c_attn = self.channel_se(y).view(b, c, 1, 1)
+        x_channel = x * c_attn
+        
+        # --- 融合 ---
+        attention_out = x_spatial + x_channel
+        
+        # 🔥🔥🔥 关键：残差连接 (Identity Mapping) 🔥🔥🔥
+        # 保证最差情况也是原始特征，绝对稳健
+        return x + attention_out
 # --- 辅助模块: 全局注意力 (FP32 Safe) ---
 class GlobalAttention(nn.Module):
     def __init__(self, dim, num_heads=4, qkv_bias=False):
@@ -448,10 +490,18 @@ class PHD_DecoderBlock_Pro(nn.Module):
         return x
 
 class Up_Universal(nn.Module):
-    def __init__(self, in_channels, out_channels, skip_channels=0, decoder_type='phd'):
+    def __init__(self, in_channels, out_channels, skip_channels=0, decoder_type='phd', use_sparse_skip=False): 
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        
+        # 🔥🔥🔥 [修改这里] 实例化 SCSE 模块 🔥🔥🔥
+        self.skip_refiner = None
+        if use_sparse_skip and skip_channels > 0:
+            print(f"   ✨ Enable SCSE Refiner (Robust) for channel {skip_channels}")
+            self.skip_refiner = SCSEModule(skip_channels) # <--- 改成这个类名！
+
         conv_in = in_channels + skip_channels
+        
         if decoder_type == 'phd':
             self.conv = PHD_DecoderBlock_Pro(conv_in, out_channels, depth=2)
         else:
@@ -460,6 +510,10 @@ class Up_Universal(nn.Module):
     def forward(self, x1, x2=None):
         x1 = self.up(x1)
         if x2 is not None:
+            # 这里不用改，只要 self.skip_refiner 不为空就会自动调用
+            if self.skip_refiner is not None:
+                x2 = self.skip_refiner(x2)
+            
             diffY, diffX = x2.size()[2] - x1.size()[2], x2.size()[3] - x1.size()[3]
             x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
             x = torch.cat([x2, x1], dim=1)
@@ -478,6 +532,7 @@ class UniversalUNet(nn.Module):
                  decoder_type='phd',       
                  use_dual_stream=True,     
                  use_deep_supervision=False,
+                 use_sparse_skip=False,  # 🔥🔥🔥 [新增] 开关参数
                  **kwargs):
         super().__init__()
         self.n_classes = n_classes
@@ -490,7 +545,7 @@ class UniversalUNet(nn.Module):
         print(f"   - Dual Stream (SFDA): {'✅ ON (Omni-Optimized)' if use_dual_stream else '❌ OFF'}")
         print(f"   - Interaction: SK-Fusion")
         print(f"   - Decoder: {decoder_type.upper()}")
-        
+        print(f"   - Sparse Skip Refiner: {'✅ ON' if use_sparse_skip else '❌ OFF'}") # 打印一下状态
         # 1. Spatial Encoder
         self.spatial_encoder = timm.create_model(cnext_type, pretrained=pretrained, features_only=True, out_indices=(0, 1, 2, 3), drop_path_rate=0.0)
         s_dims = self.spatial_encoder.feature_info.channels() 
@@ -509,9 +564,9 @@ class UniversalUNet(nn.Module):
             self.edge_head = nn.Sequential(nn.Conv2d(f_dims[0], 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(True), nn.Conv2d(64, 1, 1))
 
         # 3. Decoder
-        self.up1 = Up_Universal(s_dims[3], s_dims[2], skip_channels=s_dims[2], decoder_type=decoder_type)
-        self.up2 = Up_Universal(s_dims[2], s_dims[1], skip_channels=s_dims[1], decoder_type=decoder_type)
-        self.up3 = Up_Universal(s_dims[1], s_dims[0], skip_channels=s_dims[0], decoder_type=decoder_type)
+        self.up1 = Up_Universal(s_dims[3], s_dims[2], skip_channels=s_dims[2], decoder_type=decoder_type, use_sparse_skip=use_sparse_skip)
+        self.up2 = Up_Universal(s_dims[2], s_dims[1], skip_channels=s_dims[1], decoder_type=decoder_type, use_sparse_skip=use_sparse_skip)
+        self.up3 = Up_Universal(s_dims[1], s_dims[0], skip_channels=s_dims[0], decoder_type=decoder_type, use_sparse_skip=use_sparse_skip)
         
         self.final_up = nn.Upsample(scale_factor=4, mode='bilinear', align_corners=True)
         self.outc = nn.Conv2d(s_dims[0], n_classes, kernel_size=1)

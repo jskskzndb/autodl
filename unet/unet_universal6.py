@@ -175,11 +175,11 @@ class RecurrentSparseBlock(nn.Module):
         self.encoder = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         self.decoder = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         
-        # 🔥 修改点 1: 将 BatchNorm 改为 GroupNorm (对小 BatchSize 和 频率特征 更稳)
-        self.bn = nn.GroupNorm(8, channels) 
+        # ✅ 修改 1: GroupNorm -> BatchNorm2d
+        self.bn = nn.BatchNorm2d(channels) 
         
-        # 🔥 修改点 2: 循环内部的归一化，防止迭代发散
-        self.loop_norm = nn.GroupNorm(8, channels)
+        # ✅ 修改 2: GroupNorm -> BatchNorm2d
+        self.loop_norm = nn.BatchNorm2d(channels)
         
         self.threshold = LearnableSoftThresholding(channels)
         self._init_weights()
@@ -188,7 +188,7 @@ class RecurrentSparseBlock(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+            elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
@@ -230,7 +230,7 @@ class SFDABlock(nn.Module):
         # 1. 频率选择
         self.freq_select = nn.Sequential(
             nn.Conv2d(in_channels * 4, out_channels, 1),
-            nn.GroupNorm(8, out_channels), # 改为 GroupNorm
+            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
             FrequencyChannelAttention(out_channels) 
         )
@@ -252,7 +252,7 @@ class SFDABlock(nn.Module):
         # 4. 融合
         self.fusion = nn.Sequential(
             nn.Conv2d(out_channels * 3, out_channels, 1),
-            nn.GroupNorm(8, out_channels), # 🔥 改为 GroupNorm，防止融合时均值漂移
+            nn.BatchNorm2d(out_channels), # 🔥 修改: GN -> BN
             nn.ReLU(inplace=True)
         )
         
@@ -366,10 +366,10 @@ class StandardDoubleConv(nn.Module):
         super().__init__()
         self.double_conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
-            nn.GroupNorm(8, out_channels),  # ✅ BN -> GN
+            nn.BatchNorm2d(out_channels),  # ✅ 改为 BN
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
-            nn.GroupNorm(8, out_channels),  # ✅ BN -> GN
+            nn.BatchNorm2d(out_channels),  # ✅ 改为 BN
             nn.ReLU(inplace=True)
         )
     def forward(self, x): return self.double_conv(x)
@@ -385,7 +385,7 @@ class PrototypeInteractionBlock(nn.Module):
         self.k_proj = nn.Linear(channels, channels)
         self.v_proj = nn.Linear(channels, channels)
         self.out_proj = nn.Conv2d(channels, channels, 1)
-        self.norm = nn.GroupNorm(8, channels)
+        self.norm = nn.BatchNorm2d(channels)
         self.local_conv = nn.Sequential(nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False), nn.BatchNorm2d(channels), nn.GELU())
         self.gamma = nn.Parameter(torch.ones(channels) * 1e-5)
     def forward(self, x):
