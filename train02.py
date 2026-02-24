@@ -22,11 +22,42 @@ from utils.losses import FocalLoss, CombinedLoss, DiceLossOnly, EdgeLoss, comput
 from utils.utils import log_grad_stats
 
 from unet import UNet
+from unet.unet_universal7 import adjust_momentum, compute_lightweight_contrastive_loss, edge_aware_loss
 
 import random
 import csv
 import os
+class StandardDiceLoss(nn.Module):
+    def __init__(self, smooth=1e-5):
+        super(StandardDiceLoss, self).__init__()
+        self.smooth = smooth
 
+    def forward(self, pred_logits, targets):
+        """
+        pred_logits: 模型的原始输出 (Logits), 形状任意 [B, C, H, W] 或 [B, H, W]
+        targets: 真实标签 (0或1), 形状需与 pred_logits 匹配
+        """
+        # 1. 自动 Sigmoid 激活 (将 Logits 转为 0~1 概率)
+        probs = torch.sigmoid(pred_logits)
+        
+        # 2. 自动展平 (Flatten)
+        # 这一步是神器：它把所有维度拉成一条直线。
+        # 无论你是 [B, 1, H, W] 还是 [B, H, W]，在这里都一样了。
+        # 彻底消除 "Target size must be the same as input size" 的隐患。
+        probs_flat = probs.view(-1)
+        targets_flat = targets.view(-1)
+        
+        # 3. 计算交集 (Intersection)
+        intersection = (probs_flat * targets_flat).sum()
+        
+        # 4. 计算并集 (Union)
+        union = probs_flat.sum() + targets_flat.sum()
+        
+        # 5. 计算 Dice 系数
+        dice_score = (2. * intersection + self.smooth) / (union + self.smooth)
+        
+        # 6. 返回 1 - Dice (确保 Loss 是正数，且越小越好)
+        return 1.0 - dice_score
 class MetricLogger:
     def __init__(self, save_path):
         self.save_path = save_path
@@ -396,6 +427,8 @@ def train_model(
     # 5. 训练循环
     # ============================================================
     for epoch in range(start_epoch, epochs + 1):
+        # 🔥🔥🔥 [修改 1：计算当前 Epoch 的动量值] 🔥🔥🔥
+        current_m = adjust_momentum(epoch, epochs)
         model.train()
         epoch_loss = 0
         epoch_grad_norms = []
@@ -406,10 +439,13 @@ def train_model(
                 images, true_masks = batch['image'], batch['mask']
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
                 true_masks = true_masks.to(device=device, dtype=torch.long)
-
+                # 🔥 [关键修复]: 如果 mask 只有 3 维 [B, H, W]，强制增加通道维度变成 [B, 1, H, W]
+                if true_masks.ndim == 3:
+                    true_masks = true_masks.unsqueeze(1)
                 with torch.cuda.amp.autocast(enabled=amp):
-                    output = model(images)
-                    
+                    #output = model(images)
+                    # 🔥🔥🔥 [修改 2：传入 mask，触发记忆库更新] 🔥🔥🔥
+                    output = model(images, mask=true_masks)
                     # 🔥🔥🔥 [关键修复] 定义数值截断函数 🔥🔥🔥
                     # 防止模型输出过大导致 BCE Loss 计算出 NaN
                     def clamp_logits(x):
@@ -420,46 +456,48 @@ def train_model(
                     # ============================================================
                     loss = 0.0
                     
-                    # 1. 统一转为 List
                     if not isinstance(output, (list, tuple)):
                         output = [output]
-                    
-                    # 游标 (Cursor)
-                    current_idx = 0
-                    
-                    # A. 主 Loss
-                    pred_main = clamp_logits(output[current_idx])
-                    loss += calc_loss(pred_main, true_masks, loss_combination, focal_alpha, focal_gamma)
-                    current_idx += 1
 
-                    # B. 深监督 Loss (只有开启了 Deep Supervision 且返回了足够多的输出才算)
-                    if hasattr(model, 'use_deep_supervision') and model.use_deep_supervision:
-                        if current_idx + 1 < len(output):
-                            pred_aux2 = clamp_logits(output[current_idx])
-                            pred_aux3 = clamp_logits(output[current_idx+1])
-                            
-                            pred_aux2 = F.interpolate(pred_aux2, size=true_masks.shape[1:], mode='bilinear', align_corners=True)
-                            pred_aux3 = F.interpolate(pred_aux3, size=true_masks.shape[1:], mode='bilinear', align_corners=True)
-                            
-                            l_aux2 = calc_loss(pred_aux2, true_masks, loss_combination, focal_alpha, focal_gamma)
-                            l_aux3 = calc_loss(pred_aux3, true_masks, loss_combination, focal_alpha, focal_gamma)
-                            
-                            loss += 0.5 * l_aux2 + 0.4 * l_aux3
-                            current_idx += 2
-                    
-                    # C. 双流边缘 Loss (只要开了双流，剩下的那个就是 Edge)
-                    if hasattr(model, 'use_dual_stream') and model.use_dual_stream:
-                        if current_idx < len(output):
-                            pred_edge = clamp_logits(output[current_idx])
-                            true_edges = generate_edge_tensor(true_masks)
-                            
-                            if pred_edge.shape[2:] != true_edges.shape[2:]:
-                                pred_edge = F.interpolate(pred_edge, size=true_edges.shape[2:], mode='bilinear', align_corners=True)
-                            
-                            l_edge = F.binary_cross_entropy_with_logits(pred_edge, true_edges, pos_weight=torch.tensor([5.0], device=device))
-                            loss += lambda_edge * l_edge
-                            current_idx += 1
                     # ============================================================
+                    # 🔥 [顶刊级大招] 跨阶段自适应融合损失 (CSAF Loss) + 边缘梯度
+                    # ============================================================
+                    if hasattr(model, 'use_csaf_loss') and model.use_csaf_loss:
+                        # 4 个阶段的自适应权重配比：最深层主输出占 0.4，越浅层权重越低
+                        alphas = [0.4, 0.3, 0.2, 0.1]
+                        
+                        total_csaf_loss = 0.0
+                        for i, pred_layer in enumerate(output):
+                            # 安全防护：防止 output 长度超过 alphas 列表
+                            if i >= len(alphas):
+                                break
+                                
+                            # 1. 强制上采样对齐尺寸 (浅层特征图比较小，需要放大到原图尺寸)
+                            if pred_layer.shape[2:] != true_masks.shape[2:]:
+                                pred_layer = F.interpolate(pred_layer, size=true_masks.shape[2:], mode='bilinear', align_corners=True)
+                            
+                            pred_clamped = clamp_logits(pred_layer)
+                            
+                            # 2. 算常规的主流 BCE+Dice Loss
+                            l_bce_dice = calc_loss(pred_clamped, true_masks, loss_combination, focal_alpha, focal_gamma)
+                            
+                            # 3. 算边缘感知梯度 Loss (必须过 Sigmoid 压到 0~1 之间才能算物理梯度)
+                            pred_probs = torch.sigmoid(pred_clamped)
+                            l_edge = edge_aware_loss(pred_probs, true_masks)
+                            
+                            # 4. FDENet 黄金比例融合: 0.95 的语义约束 + 0.05 的边缘约束
+                            stage_loss = 0.95 * l_bce_dice + 0.05 * l_edge
+                            
+                            # 5. 乘以跨阶段权重，并累加到总 Loss
+                            total_csaf_loss += alphas[i] * stage_loss
+                            
+                        loss += total_csaf_loss
+                        
+                    else:
+                        # 兼容老版本单头模型逻辑
+                        pred_main = clamp_logits(output[0])
+                        loss += calc_loss(pred_main, true_masks, loss_combination, focal_alpha, focal_gamma)
+                        
                     loss = loss / accumulation_steps
                 
                 # 异常检测
@@ -498,6 +536,13 @@ def train_model(
                     
                     # 更新完后才清零
                     optimizer.zero_grad(set_to_none=True)
+                    # 🔥🔥🔥 [修改 3：动量更新 Teacher] 🔥🔥🔥
+                    # 必须在 Student 更新完毕后执行！
+                    # 如果用了 DDP/DataParallel，需要加 .module
+                    if hasattr(model, 'module'):
+                        model.module.momentum_update_teacher(current_momentum=current_m)
+                    else:
+                        model.momentum_update_teacher(current_momentum=current_m)
 
                     # WandB 实时日志 (还原 loss 数值用于显示)
                     experiment.log({
@@ -640,48 +685,39 @@ def train_model(
 # 计算 Loss 辅助函数 (保持不变)
 def calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma):
     """
-    🔥 [最终完整版] 
-    1. 强制 FP32 计算 (V100 保命)
-    2. 保留了原本的 try-except 兼容逻辑
+    🔥 [通用版] 兼容所有 Loss 组合，且数值稳定
     """
-    # -----------------------------------------------------------
-    # 1. 全局强制转换：进门先安检，统统变 float32
-    # -----------------------------------------------------------
+    # 1. 类型安全转换
     masks_pred = masks_pred.float()
     true_masks = true_masks.float()
 
-    # -----------------------------------------------------------
-    # 2. 分情况计算 (注意：下面都不需要再写 .float() 了)
-    # -----------------------------------------------------------
+    # 2. 实例化基础 Loss
+    bce_func = nn.BCEWithLogitsLoss()
+    dice_func = StandardDiceLoss()  # 使用刚才定义的标准类
+    focal_func = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+
+    # 3. 根据指令分发 (逻辑极其清晰，方便你以后改)
     if loss_combination == 'bce':
-        criterion = nn.BCEWithLogitsLoss()
-        return criterion(masks_pred.squeeze(1), true_masks)
-    
-    elif loss_combination == 'focal':
-        criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-        return criterion(masks_pred.squeeze(1), true_masks)
+        return bce_func(masks_pred, true_masks)
     
     elif loss_combination == 'dice':
-        # 确保 sigmoid 也在 float32 下进行
-        return dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks, multiclass=False)
+        return dice_func(masks_pred, true_masks)
+    
+    elif loss_combination == 'focal':
+        return focal_func(masks_pred, true_masks)
+        
+    elif loss_combination == 'bce+dice':
+        # 正数 + 正数 = 稳健的总 Loss
+        loss_bce = bce_func(masks_pred, true_masks)
+        loss_dice = dice_func(masks_pred, true_masks)
+        return loss_bce + loss_dice
     
     else:
-        # -----------------------------------------------------------
-        # 3. 组合 Loss (保留你原来的 try-except 逻辑)
-        # -----------------------------------------------------------
-        try:
-            # 尝试调用封装好的类
-            criterion = CombinedLoss(loss_combination.split('+'), [1.0, 1.0], focal_alpha, focal_gamma)
-            return criterion(masks_pred.squeeze(1), true_masks)
-        except:
-            # 🔥 Fallback: 手动相加
-            # 这里的 input 已经是 float32 了，计算非常安全
-            bce = nn.BCEWithLogitsLoss()(masks_pred.squeeze(1), true_masks)
-            
-            # Dice 需要 sigmoid 后的概率
-            dice = dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks, multiclass=False)
-            
-            return bce + dice
+        # 默认回退方案 (也是 BCE+Dice)
+        # 这里你可以加自己的 try-except CombinedLoss 逻辑，但我建议直接用下面的稳健写法
+        loss_bce = bce_func(masks_pred, true_masks)
+        loss_dice = dice_func(masks_pred, true_masks)
+        return loss_bce + loss_dice
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the Unified UNet')

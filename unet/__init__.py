@@ -71,4 +71,8 @@
 
 #🟢 全能型 UNet
 #功能: 一个类实现 4 种架构组合，通过参数控制。PHD×2，8原型
-from .unet_universal6 import UniversalUNet as UNet
+#from .unet_universal6 import UniversalUNet as UNet
+
+#🟢 全能型 UNet
+#功能: 一个类实现 4 种架构组合，通过参数控制。PHD×2，8原型
+from .unet_universal7 import UniversalUNet as UNet
