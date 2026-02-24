@@ -135,7 +135,7 @@ def get_args():
     parser.add_argument('--output-dir', type=str, default='data/test/predictions')
     
     # 架构参数 (必须与训练时一致)
-    parser.add_argument('--encoder', type=str, default='resnet', choices=['resnet', 'cnextv2', 'standard'])
+    parser.add_argument('--encoder', type=str, default='resnet', choices=['resnet', 'cnextv2', 'standard', 'swin'])
     parser.add_argument('--decoder', type=str, default='phd', choices=['phd', 'standard'])
     parser.add_argument('--cnext-type', type=str, default='convnextv2_base')
     parser.add_argument('--bilinear', action='store_true', default=False)

@@ -18,72 +18,71 @@ import copy
 import math
 class DIAM(nn.Module):
     def __init__(self, query_channels, value_channels, K=4):
-        """
-        K: 每个像素发出的“探测触手”数量 (采样点数)，4 是效果和速度的最佳平衡点
-        """
         super().__init__()
         self.K = K
         
-        # 1. 偏移量预测头：预测 K 个点的 (x, y) 偏移，输出 2K 个通道
         self.offset_conv = nn.Sequential(
             nn.Conv2d(query_channels, query_channels // 2, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(query_channels // 2, 2 * K, kernel_size=3, padding=1)
         )
         
-        # 2. 注意力权重预测头：预测这 K 个点的重要性，输出 K 个通道
         self.weight_conv = nn.Sequential(
             nn.Conv2d(query_channels, query_channels // 2, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(query_channels // 2, K, kernel_size=3, padding=1)
         )
         
-        # 🔥 [终极防崩技巧] 零初始化 (Zero-Init)
-        # 让偏移量和权重在训练初始阶段全为 0，等价于普通的逐像素相加，保护预训练权重不被破坏
+        # 零初始化
         nn.init.zeros_(self.offset_conv[-1].weight)
         nn.init.zeros_(self.offset_conv[-1].bias)
         nn.init.zeros_(self.weight_conv[-1].weight)
         nn.init.zeros_(self.weight_conv[-1].bias)
 
     def forward(self, q, v):
-        """
-        q: 深层特征 (Query) [B, C_q, H, W] - 语义准，但边缘糊
-        v: 浅层特征 (Value) [B, C_v, H, W] - 边缘准，但噪声大
-        """
         B, C_v, H, W = v.shape
         
-        # 1. 预测当前分辨率下的偏移量和权重
-        offsets = self.offset_conv(q) # [B, 2K, H, W]
-        weights = self.weight_conv(q) # [B, K, H, W]
-        weights = torch.softmax(weights, dim=1) # 保证 K 个抓取点的权重和为 1
-        
-        # 2. 生成标准坐标网格 [-1, 1] (配合 grid_sample 的要求)
-        y_grid, x_grid = torch.meshgrid(
-            torch.linspace(-1, 1, H, dtype=q.dtype, device=q.device),
-            torch.linspace(-1, 1, W, dtype=q.dtype, device=q.device),
-            indexing='ij'
-        )
-        base_grid = torch.stack([x_grid, y_grid], dim=-1) # [H, W, 2] 存储 (x,y)
-        base_grid = base_grid.unsqueeze(0).repeat(B, 1, 1, 1) # [B, H, W, 2]
-        
-        out_v = torch.zeros_like(v)
-        
-        # 3. 动态抓取与融合
-        for k in range(self.K):
-            # 提取第 k 个探测点的偏移量
-            offset_k = offsets[:, 2*k:2*k+2, :, :].permute(0, 2, 3, 1) # [B, H, W, 2]
+        # 🔥🔥🔥 [终极防御] 强制关闭 AMP，全部转为 FP32 进行极高精度计算 🔥🔥🔥
+        with torch.cuda.amp.autocast(enabled=False):
+            q_32 = q.float()
+            v_32 = v.float()
             
-            # 变形网格 = 基础网格 + 偏移量
-            grid_k = base_grid + offset_k 
+            # 1. 预测当前分辨率下的偏移量和权重
+            offsets = self.offset_conv(q_32)
             
-            # 使用双线性插值在浅层特征 v 上抓取亚像素
-            v_sampled = F.grid_sample(v, grid_k, mode='bilinear', padding_mode='zeros', align_corners=True)
+            # 🔥 [防御 1] 物理截断偏移量！
+            # 网格坐标范围是 [-1, 1]，如果 offset 跑得太远（比如几百），grid_sample 的梯度会直接炸裂。
+            # 我们把它限制在 [-2.0, 2.0] 之间，防止“触手”飞出银河系。
+            offsets = torch.clamp(offsets, min=-2.0, max=2.0)
             
-            # 乘以对应的注意力权重并累加
-            weight_k = weights[:, k:k+1, :, :] # [B, 1, H, W]
-            out_v += v_sampled * weight_k
+            weights = self.weight_conv(q_32)
+            # 🔥 [防御 2] 截断 logits，防止 Softmax 产生 0 或 NaN
+            weights = torch.clamp(weights, min=-30.0, max=30.0) 
+            weights = torch.softmax(weights, dim=1) 
             
-        return out_v
+            # 2. 生成标准坐标网格 [-1, 1] (此时必须使用 FP32 精度生成)
+            y_grid, x_grid = torch.meshgrid(
+                torch.linspace(-1, 1, H, dtype=torch.float32, device=q.device),
+                torch.linspace(-1, 1, W, dtype=torch.float32, device=q.device),
+                indexing='ij'
+            )
+            base_grid = torch.stack([x_grid, y_grid], dim=-1) 
+            base_grid = base_grid.unsqueeze(0).repeat(B, 1, 1, 1) 
+            
+            out_v_32 = torch.zeros_like(v_32)
+            
+            # 3. 动态抓取与融合
+            for k in range(self.K):
+                offset_k = offsets[:, 2*k:2*k+2, :, :].permute(0, 2, 3, 1) 
+                grid_k = base_grid + offset_k 
+                
+                # F.grid_sample 在 FP32 下计算极其稳定
+                v_sampled = F.grid_sample(v_32, grid_k, mode='bilinear', padding_mode='zeros', align_corners=True)
+                weight_k = weights[:, k:k+1, :, :]
+                out_v_32 += v_sampled * weight_k
+                
+        # 🔥 计算完毕后，安全地转回原来的 dtype (如果外面开了 AMP，这里会转回 FP16 给下一层)
+        return out_v_32.to(v.dtype)
 # ================================================================
 # 1. 核心引擎：非参数化记忆库 (Memory Bank)
 # ================================================================
@@ -260,7 +259,7 @@ class Up_Universal(nn.Module):
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         # 🔥 [新增] 实例化 DIAM 模块
         # in_channels 是深层上采样后的通道数，skip_channels 是浅层跳跃连接的通道数
-        self.diam = DIAM(query_channels=in_channels, value_channels=skip_channels, K=4)
+        #self.diam = DIAM(query_channels=in_channels, value_channels=skip_channels, K=4)
         # 🔥 [找回丢失的代码] 必须要有这个卷积块，否则 return self.conv(x) 会找不到对象！
         conv_in = in_channels + skip_channels
         self.conv = PHD_DecoderBlock_Pro(conv_in, out_channels, memory_bank, depth=2)
@@ -271,10 +270,11 @@ class Up_Universal(nn.Module):
         x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
         
         # 🔥 [核心手术] 使用 DIAM 让浅层特征 x2 主动形变，对齐深层特征 x1
-        x2_aligned = self.diam(q=x1, v=x2)
+        # x2_aligned = self.diam(q=x1, v=x2)
         
         # 通道拼接 (此时 x2_aligned 的边缘已经被完全“拉扯”到了正确的语义边界上)
-        x = torch.cat([x2_aligned, x1], dim=1)
+        #x = torch.cat([x2_aligned, x1], dim=1)
+        x = torch.cat([x2, x1], dim=1)
         return self.conv(x)
 
 
@@ -298,7 +298,7 @@ class UniversalUNet(nn.Module):
         # --------------------------------------------------------
         # [A] Student 架构 (用于梯度更新与前向推理)
         # --------------------------------------------------------
-        self.spatial_encoder = timm.create_model(cnext_type, pretrained=pretrained, features_only=True, out_indices=(0, 1, 2, 3), drop_path_rate=0.0)
+        self.spatial_encoder = timm.create_model(cnext_type, pretrained=pretrained, features_only=True, out_indices=(0, 1, 2, 3), drop_path_rate=0.0, img_size=512)
         s_dims = self.spatial_encoder.feature_info.channels() 
         
         self.memory_bank = FeatureMemoryBank(capacity=4096, dim=128)
@@ -344,6 +344,10 @@ class UniversalUNet(nn.Module):
         """
         # 1. Student Encoder 提取特征
         s_feats = self.spatial_encoder(x)
+        # 🔥🔥🔥 [核心修复 1: Swin 维度大翻转] 🔥🔥🔥
+        # 如果最后一个维度等于通道数，说明是 [B, H, W, C] 格式，强制翻转为 [B, C, H, W]
+        if s_feats[0].shape[-1] == self.spatial_encoder.feature_info.channels()[0]:
+            s_feats = [f.permute(0, 3, 1, 2).contiguous() for f in s_feats]
         
         # 2. Decoder 路径
         d1 = self.up1(s_feats[3], s_feats[2])
@@ -376,6 +380,9 @@ class UniversalUNet(nn.Module):
         """
         # 1. Teacher 前向传播 (极其稳定)
         t_feats = self.teacher_encoder(x)
+        # 🔥🔥🔥 [核心修复 2: Teacher 同步翻转] 🔥🔥🔥
+        if t_feats[0].shape[-1] == self.teacher_encoder.feature_info.channels()[0]:
+            t_feats = [f.permute(0, 3, 1, 2).contiguous() for f in t_feats]
         t_bottleneck = t_feats[3]
         
         # 2. 投影并显式切断计算图 (🔥 修改 A：彻底断绝显存泄漏 OOM 隐患)

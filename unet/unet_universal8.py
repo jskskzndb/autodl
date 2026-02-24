@@ -101,7 +101,70 @@ class GlobalAttention(nn.Module):
             x_out = x_out.transpose(1, 2).reshape(B, C, H, W)
             
         return x_out
+# ================================================================
+# 🔥 [新增] 复刻 DeepSwinLite 的高级辅助监督头
+# 论文来源: Section 3.1.5, Figure 5
+# ================================================================
 
+class SEBlock(nn.Module):
+    """ Squeeze-and-Excitation Block (论文 Eq. 11) """
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        # Squeeze: 全局平均池化
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # Excitation: 两个 1x1 卷积 + ReLU + Sigmoid
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x)
+        y = self.fc(y)
+        # 通过乘法重新加权特征
+        return x * y
+
+class DeepSwinAuxHead(nn.Module):
+    """ 
+    DeepSwinLite 论文同款 AuxHead Module 
+    结构: Conv(LeakyReLU) -> Conv(SiLU) -> SE -> Dropout -> Output
+    """
+    def __init__(self, in_channels, num_classes=1):
+        super().__init__()
+        mid_channels = in_channels // 2  # 论文提到通道数减半 [cite: 252]
+        
+        # Block 1: Conv 3x3 + BN + LeakyReLU (稳定梯度流) 
+        self.block1 = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True)
+        )
+        
+        # Block 2: Conv 3x3 + BN + SiLU (平滑非线性) 
+        self.block2 = nn.Sequential(
+            nn.Conv2d(mid_channels, mid_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.SiLU(inplace=True) # Swish 激活函数
+        )
+        
+        # Block 3: SE Attention (特征筛选) 
+        self.se = SEBlock(mid_channels, reduction=8)
+        
+        # Dropout (防止过拟合) 
+        self.dropout = nn.Dropout2d(p=0.3)
+        
+        # Final Output
+        self.out_conv = nn.Conv2d(mid_channels, num_classes, 1)
+
+    def forward(self, x):
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.se(x)      # 注意力加权
+        x = self.dropout(x) # 随机丢弃
+        return self.out_conv(x)
 # ================================================================
 # 1. 核心模块: SFDA Block (频率流 - 全能型)
 # ================================================================
@@ -484,12 +547,14 @@ class UniversalUNet(nn.Module):
         self.use_dual_stream = use_dual_stream
         self.decoder_type = decoder_type
         self.use_deep_supervision = use_deep_supervision
-        
+        self.use_csaf_loss = True
+        self.use_deep_supervision = True
         print(f"🤖 [Universal Model] Initialized with:")
         print(f"   - Encoder: {cnext_type}")
         print(f"   - Dual Stream (SFDA): {'✅ ON (Omni-Optimized)' if use_dual_stream else '❌ OFF'}")
         print(f"   - Interaction: SK-Fusion")
         print(f"   - Decoder: {decoder_type.upper()}")
+        print(f"   - CSAF Loss: {'✅ ON' if self.use_csaf_loss else '❌ OFF'}") # 打印一下确认
         # 🔥 [新增] 记录 encoder 名字，用于 forward 里精准识别
         self.encoder_name = cnext_type.lower()
         # 1. Spatial Encoder
@@ -519,8 +584,10 @@ class UniversalUNet(nn.Module):
         
         # 4. Deep Supervision
         if self.use_deep_supervision:
-            self.head_up2 = nn.Sequential(nn.Conv2d(s_dims[1], 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.Conv2d(32, n_classes, 1))
-            self.head_up3 = nn.Sequential(nn.Conv2d(s_dims[0], 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.Conv2d(32, n_classes, 1))
+            # 替换掉原来的 nn.Sequential
+            # s_dims[1] 是 up2 的输入通道， s_dims[0] 是 up3 的输入通道
+            self.head_up2 = DeepSwinAuxHead(in_channels=s_dims[1], num_classes=n_classes)
+            self.head_up3 = DeepSwinAuxHead(in_channels=s_dims[0], num_classes=n_classes)
 
     def forward(self, x):
         s_feats = list(self.spatial_encoder(x))

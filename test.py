@@ -90,7 +90,7 @@ def get_args():
     parser.add_argument('--batch-size', '-b', type=int, default=1)
     
     # === 架构参数 (必须与 train.py / test01.py 一致) ===
-    parser.add_argument('--encoder', type=str, default='resnet', choices=['resnet', 'cnextv2', 'standard'])
+    parser.add_argument('--encoder', type=str, default='resnet', choices=['resnet', 'cnextv2', 'standard', 'swin'])
     parser.add_argument('--decoder', type=str, default='phd', choices=['phd', 'standard'])
     parser.add_argument('--cnext-type', type=str, default='convnextv2_base')
     parser.add_argument('--bilinear', action='store_true', default=False)

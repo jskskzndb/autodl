@@ -445,14 +445,11 @@ def train_model(
                 with torch.cuda.amp.autocast(enabled=amp):
                     #output = model(images)
                     # 🔥🔥🔥 [修改 2：传入 mask，触发记忆库更新] 🔥🔥🔥
-                    output = model(images, mask=true_masks)
+                    output = model(images)
                     # 🔥🔥🔥 [关键修复] 定义数值截断函数 🔥🔥🔥
                     # 防止模型输出过大导致 BCE Loss 计算出 NaN
                     def clamp_logits(x):
                         return torch.clamp(x, min=-20, max=20)
-
-                    # 初始化 Loss
-                    # 🔥🔥🔥 [修复] 动态 Loss 计算，完美兼容“无深度监督” 🔥🔥🔥
                     # ============================================================
                     loss = 0.0
                     
@@ -735,7 +732,7 @@ def get_args():
     parser.add_argument('--start-epoch', type=int, default=1)
     
     # 架构参数
-    parser.add_argument('--encoder', type=str, default='resnet', choices=['resnet', 'cnextv2', 'standard'])
+    parser.add_argument('--encoder', type=str, default='resnet', choices=['resnet', 'cnextv2', 'standard', 'swin'])
     parser.add_argument('--decoder', type=str, default='phd', choices=['phd', 'standard'])
     parser.add_argument('--cnext-type', type=str, default='convnextv2_base')
     
