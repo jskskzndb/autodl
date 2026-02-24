@@ -361,7 +361,7 @@ def train_model(
         optimizer,
         t_initial=epochs,            # 周期长度 (总 Epoch)
         lr_min=1e-6,                 # 最小学习率 (训练结束时降到多少)
-        warmup_t=warmup_epochs,      # Warmup 持续多少个 Epoch
+        warmup_t=1,      # Warmup 持续多少个 Epoch
         warmup_lr_init=1e-6,         # Warmup 初始学习率 (从这个值线性升到目标 lr)
         warmup_prefix=False           # 设为 True，表示 warmup 过程包含在总周期计算逻辑中
     )
@@ -428,7 +428,7 @@ def train_model(
     # ============================================================
     for epoch in range(start_epoch, epochs + 1):
         # 🔥🔥🔥 [修改 1：计算当前 Epoch 的动量值] 🔥🔥🔥
-        current_m = adjust_momentum(epoch, epochs)
+        #current_m = adjust_momentum(epoch, epochs)
         model.train()
         epoch_loss = 0
         epoch_grad_norms = []
@@ -436,9 +436,18 @@ def train_model(
         
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
             for i, batch in enumerate(train_loader):
+                
+                    
                 images, true_masks = batch['image'], batch['mask']
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                true_masks = true_masks.to(device=device, dtype=torch.long)
+                # 🔥🔥🔥 [核心修复] 必须转为 float 并除以 255 !!! 🔥🔥🔥
+                true_masks = true_masks.to(device=device, dtype=torch.float32)
+                
+                # 自动检测是否需要归一化 (如果最大值 > 1，说明是 0-255 的图)
+                if true_masks.max() > 1.0:
+                    true_masks = true_masks / 255.0
+                # 2. 🔥🔥🔥 [核心修复] Mask 先转 float，不要直接转 long !!! 🔥🔥🔥
+                true_masks = true_masks.to(device=device, dtype=torch.float32)
                 # 🔥 [关键修复]: 如果 mask 只有 3 维 [B, H, W]，强制增加通道维度变成 [B, 1, H, W]
                 if true_masks.ndim == 3:
                     true_masks = true_masks.unsqueeze(1)
@@ -536,10 +545,10 @@ def train_model(
                     # 🔥🔥🔥 [修改 3：动量更新 Teacher] 🔥🔥🔥
                     # 必须在 Student 更新完毕后执行！
                     # 如果用了 DDP/DataParallel，需要加 .module
-                    if hasattr(model, 'module'):
-                        model.module.momentum_update_teacher(current_momentum=current_m)
-                    else:
-                        model.momentum_update_teacher(current_momentum=current_m)
+                    #if hasattr(model, 'module'):
+                    #    model.module.momentum_update_teacher(current_momentum=current_m)
+                    #else:
+                    #    model.momentum_update_teacher(current_momentum=current_m)
 
                     # WandB 实时日志 (还原 loss 数值用于显示)
                     experiment.log({
@@ -829,6 +838,25 @@ if __name__ == '__main__':
     
     model = model.to(memory_format=torch.channels_last)
     model.to(device=device)
+    # 👇👇👇 【最终修正版：精准定位权重】 👇👇👇
+    print("\n🧐 [权重侦探 3.0] 正在检查 Swin 权重...")
+    found_layer = False
+    
+    # 遍历参数，寻找我们在日志里看到的那个特定名字
+    target_name = "layers_0.blocks.0.norm1.weight"
+    
+    for name, param in model.spatial_encoder.named_parameters():
+        if target_name in name:
+            print(f"✅ 成功锁定参数: {name}")
+            print(f"🧐 [指纹] Mean: {param.mean().item():.8f}") # 保留8位小数看细节
+            print(f"🧐 [指纹] Std:  {param.std().item():.8f}")
+            found_layer = True
+            break
+    
+    if not found_layer:
+        print("❌ 依然未找到！这不可能...请检查代码拼写。")
+    print("\n")
+    # 👆👆👆 【插入结束】 👆👆👆
     # =================================================================================
     # 🔥 [新增代码] 计算并打印模型参数量
     # =================================================================================

@@ -547,14 +547,13 @@ class UniversalUNet(nn.Module):
         self.use_dual_stream = use_dual_stream
         self.decoder_type = decoder_type
         self.use_deep_supervision = use_deep_supervision
-        self.use_csaf_loss = True
-        self.use_deep_supervision = True
+        
         print(f"🤖 [Universal Model] Initialized with:")
         print(f"   - Encoder: {cnext_type}")
         print(f"   - Dual Stream (SFDA): {'✅ ON (Omni-Optimized)' if use_dual_stream else '❌ OFF'}")
         print(f"   - Interaction: SK-Fusion")
         print(f"   - Decoder: {decoder_type.upper()}")
-        print(f"   - CSAF Loss: {'✅ ON' if self.use_csaf_loss else '❌ OFF'}") # 打印一下确认
+        self.use_deep_supervision = use_deep_supervision
         # 🔥 [新增] 记录 encoder 名字，用于 forward 里精准识别
         self.encoder_name = cnext_type.lower()
         # 1. Spatial Encoder
