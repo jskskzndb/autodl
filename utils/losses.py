@@ -48,10 +48,9 @@ class EdgeLoss(nn.Module):
                
         return loss
 
+# utils/losses.py 修正版
+
 class FocalLoss(nn.Module):
-    """
-    一个更健壮、注释更清晰的 Focal Loss 实现，用于二分类分割任务。
-    """
     def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = 'mean', epsilon: float = 1e-7):
         super(FocalLoss, self).__init__()
         self.alpha = alpha
@@ -60,12 +59,15 @@ class FocalLoss(nn.Module):
         self.epsilon = epsilon
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor):
-        # 内部强制转换为 float 类型
         targets = targets.float()
-
-        # 如果 inputs 的形状是 [B, 1, H, W]，则去掉 channel 维度以匹配 targets
-        if inputs.dim() == 4 and inputs.shape[1] == 1:
-            inputs = inputs.squeeze(1)
+        
+        # 🔥 [核心修复]：确保 inputs 和 targets 维度完全一致
+        # 如果一个是 4 维 [B, 1, H, W]，另一个是 3 维 [B, H, W]，则统一
+        if inputs.dim() != targets.dim():
+            if inputs.dim() == 4 and inputs.shape[1] == 1:
+                inputs = inputs.squeeze(1)
+            if targets.dim() == 4 and targets.shape[1] == 1:
+                targets = targets.squeeze(1)
 
         bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
         p = torch.sigmoid(inputs)
@@ -82,22 +84,28 @@ class FocalLoss(nn.Module):
         else:
             return focal_loss
 
-
 class DiceLossOnly(nn.Module):
-    """
-    独立的Dice损失函数类
-    """
     def __init__(self, epsilon: float = 1e-6):
         super(DiceLossOnly, self).__init__()
         self.epsilon = epsilon
     
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor):
         probs = torch.sigmoid(inputs)
-        if probs.dim() == 4 and probs.shape[1] == 1:
-            probs = probs.squeeze(1)
         targets = targets.float()
-        intersection = 2.0 * (probs * targets).sum()
-        union = probs.sum() + targets.sum()
+
+        # 🔥 [核心修复]：同样处理维度对齐
+        if probs.dim() != targets.dim():
+            if probs.dim() == 4 and probs.shape[1] == 1:
+                probs = probs.squeeze(1)
+            if targets.dim() == 4 and targets.shape[1] == 1:
+                targets = targets.squeeze(1)
+
+        # 展平处理，这样无论 3 维还是 4 维都能算对
+        probs_flat = probs.reshape(-1)
+        targets_flat = targets.reshape(-1)
+
+        intersection = 2.0 * (probs_flat * targets_flat).sum()
+        union = probs_flat.sum() + targets_flat.sum()
         dice_score = (intersection + self.epsilon) / (union + self.epsilon)
         return 1.0 - dice_score
 

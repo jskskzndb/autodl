@@ -361,7 +361,7 @@ def train_model(
         optimizer,
         t_initial=epochs,            # 周期长度 (总 Epoch)
         lr_min=1e-6,                 # 最小学习率 (训练结束时降到多少)
-        warmup_t=1,      # Warmup 持续多少个 Epoch
+        warmup_t=warmup_epochs,      # Warmup 持续多少个 Epoch    
         warmup_lr_init=1e-6,         # Warmup 初始学习率 (从这个值线性升到目标 lr)
         warmup_prefix=False           # 设为 True，表示 warmup 过程包含在总周期计算逻辑中
     )
@@ -689,41 +689,62 @@ def train_model(
     wandb.finish()
 
 # 计算 Loss 辅助函数 (保持不变)
+# ============================================================
+# 🔥 [修改版] calc_loss: 支持 utils 中的 FocalLoss 及三合一组合
+# ============================================================
 def calc_loss(masks_pred, true_masks, loss_combination, focal_alpha, focal_gamma):
     """
-    🔥 [通用版] 兼容所有 Loss 组合，且数值稳定
+    masks_pred: 模型输出的 Logits (未经过 Sigmoid)
+    true_masks: 真实标签 (0 或 1)
     """
-    # 1. 类型安全转换
+    # 1. 类型转换，确保精度
     masks_pred = masks_pred.float()
     true_masks = true_masks.float()
 
-    # 2. 实例化基础 Loss
+    # 2. 实例化 Loss 函数
+    # A. BCE: 自带 Sigmoid，专吃 Logits
     bce_func = nn.BCEWithLogitsLoss()
-    dice_func = StandardDiceLoss()  # 使用刚才定义的标准类
+    
+    # B. Dice: 你定义的 StandardDiceLoss 内部有 sigmoid，专吃 Logits
+    dice_func = StandardDiceLoss() 
+    
+    # C. Focal: 直接使用 utils.losses 中的类
+    # 假设你的 utils.losses.FocalLoss 是基于 BCEWithLogitsLoss 实现的，或者能处理 Logits
     focal_func = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
 
-    # 3. 根据指令分发 (逻辑极其清晰，方便你以后改)
-    if loss_combination == 'bce':
-        return bce_func(masks_pred, true_masks)
+    # 3. 解析组合名称 (例如 "bce+focal+dice")
+    loss_names = loss_combination.split('+')
+
+    # 4. 🔥🔥🔥 核心组合逻辑 🔥🔥🔥
     
+    # 情况 A: 三合一全能组合 (BCE + Focal + Dice)
+    if 'bce' in loss_names and 'focal' in loss_names and 'dice' in loss_names:
+        l_bce = bce_func(masks_pred, true_masks)
+        l_focal = focal_func(masks_pred, true_masks)
+        l_dice = dice_func(masks_pred, true_masks)
+        
+        # 🌟 推荐配比: 0.5 BCE (稳基准) + 0.5 Focal (抓难点) + 1.0 Dice (保形状)
+        return 0.5 * l_bce + 0.5 * l_focal + 1.0 * l_dice
+
+    # 情况 B: BCE + Dice (经典组合)
+    elif 'bce' in loss_names and 'dice' in loss_names:
+        return bce_func(masks_pred, true_masks) + dice_func(masks_pred, true_masks)
+    
+    # 情况 C: Focal + Dice (激进组合)
+    elif 'focal' in loss_names and 'dice' in loss_names:
+        return focal_func(masks_pred, true_masks) + dice_func(masks_pred, true_masks)
+
+    # 情况 D: 单个 Loss
+    elif loss_combination == 'bce':
+        return bce_func(masks_pred, true_masks)
     elif loss_combination == 'dice':
         return dice_func(masks_pred, true_masks)
-    
     elif loss_combination == 'focal':
         return focal_func(masks_pred, true_masks)
-        
-    elif loss_combination == 'bce+dice':
-        # 正数 + 正数 = 稳健的总 Loss
-        loss_bce = bce_func(masks_pred, true_masks)
-        loss_dice = dice_func(masks_pred, true_masks)
-        return loss_bce + loss_dice
     
+    # 默认回退
     else:
-        # 默认回退方案 (也是 BCE+Dice)
-        # 这里你可以加自己的 try-except CombinedLoss 逻辑，但我建议直接用下面的稳健写法
-        loss_bce = bce_func(masks_pred, true_masks)
-        loss_dice = dice_func(masks_pred, true_masks)
-        return loss_bce + loss_dice
+        return bce_func(masks_pred, true_masks) + dice_func(masks_pred, true_masks)
 
 def get_args():
     parser = argparse.ArgumentParser(description='Train the Unified UNet')
