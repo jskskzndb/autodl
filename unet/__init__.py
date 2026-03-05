@@ -83,4 +83,6 @@
 
 #from .unet_universal10 import UniversalUNet as UNet
 
-from .unet_universal11 import UniversalUNet as UNet
+#from .unet_universal11 import UniversalUNet as UNet
+
+from .unet_universal12 import UniversalUNet as UNet

@@ -431,6 +431,8 @@ def train_model(
         #current_m = adjust_momentum(epoch, epochs)
         model.train()
         epoch_loss = 0
+        epoch_loss_main = 0.0
+        epoch_loss_edge = 0.0
         epoch_grad_norms = []
         batch_count = 0
         
@@ -461,7 +463,8 @@ def train_model(
                         return torch.clamp(x, min=-20, max=20)
                     # ============================================================
                     loss = 0.0
-                    
+                    loss_main = 0.0  # 🔥 新增：提前初始化，确保变量始终存在
+                    loss_edge = 0.0  # 🔥 新增：提前初始化，确保变量始终存在
                     if not isinstance(output, (list, tuple)):
                         output = [output]
 
@@ -499,12 +502,31 @@ def train_model(
                             
                         loss += total_csaf_loss
                         
+                    
                     else:
-                        # 兼容老版本单头模型逻辑
+                        # --- A. 面积主损失 ---
                         pred_main = clamp_logits(output[0])
-                        loss += calc_loss(pred_main, true_masks, loss_combination, focal_alpha, focal_gamma)
+                        loss_main = calc_loss(pred_main, true_masks, loss_combination, focal_alpha, focal_gamma)
                         
+                        # --- B. 边缘模具损失 (IGS 引导) ---
+                        loss_edge = torch.tensor(0.0, device=device)
+                        # 核心修改：接住模型最后 append 的那个 boundary_weight
+                        if len(output) > 1 and lambda_edge > 0:
+                            boundary_weight = output[-1]
+                            # 拿到你专业的形态学边缘标签
+                            gt_edges = generate_edge_tensor(true_masks, edge_width=3)
+                            # 注意：模型里 boundary_weight 已经过了 sigmoid，这里用 BCELoss
+                            loss_edge = nn.BCELoss()(boundary_weight, gt_edges)
+                        
+                        # --- C. 融合 ---
+                        loss += (loss_main + lambda_edge * loss_edge)
+                        epoch_loss_main += loss_main.item()
+                        epoch_loss_edge += loss_edge.item() if isinstance(loss_edge, torch.Tensor) else loss_edge
+                    # 统一处理梯度累积
                     loss = loss / accumulation_steps
+                        
+                        
+                    
                 
                 # 异常检测
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -551,13 +573,29 @@ def train_model(
                     #    model.momentum_update_teacher(current_momentum=current_m)
 
                     # WandB 实时日志 (还原 loss 数值用于显示)
-                    experiment.log({
+                    
+                    # ============================================================
+                    # 📊 实时日志记录 (适配双轨 Loss)
+                    # ============================================================
+                    log_dict = {
                         'train/loss_batch': loss.item() * accumulation_steps, 
                         'train/grad_norm': grad_norm.item(), 
                         'global_step': global_step
-                    })
+                    }
+                    
+                    # 🔥 [关键] 检查是否存在独立分支的 Loss 变量名，存在则记录
+                    if 'loss_main' in locals():
+                        log_dict.update({
+                            'train/loss_main': loss_main.item() if isinstance(loss_main, torch.Tensor) else loss_main,
+                            'train/loss_edge': loss_edge.item() if isinstance(loss_edge, torch.Tensor) else loss_edge
+                        })
+                    
+                    experiment.log(log_dict)
+                    
+                    # 进度条同步更新
                     pbar.set_postfix(**{'loss': loss.item() * accumulation_steps, 'grad': grad_norm.item()})
                     global_step += 1
+                        
 
                 pbar.update(images.shape[0])
                 batch_count += 1
@@ -566,6 +604,8 @@ def train_model(
 
         # ====== 验证与评估 ======
         avg_epoch_loss = epoch_loss / max(batch_count, 1)
+        avg_epoch_loss_main = epoch_loss_main / max(batch_count, 1)
+        avg_epoch_loss_edge = epoch_loss_edge / max(batch_count, 1)
         avg_grad_norm = sum(epoch_grad_norms) / len(epoch_grad_norms) if epoch_grad_norms else 0.0
         # 🔴 [修改 1] 传入 criterion
         # 注意：这里我们使用定义好的 criterion 计算 loss
@@ -610,6 +650,8 @@ def train_model(
         experiment.log({
             'train/epoch_loss': avg_epoch_loss,
             'val/loss': val_metrics['loss'],       # <--- 关键！添加这一行！
+            'train/epoch_loss_main': avg_epoch_loss_main,
+            'train/epoch_loss_edge': avg_epoch_loss_edge,
             'train/avg_grad_norm': avg_grad_norm,
             'val/dice': val_metrics['dice'],
             'val/iou': val_metrics['iou'],

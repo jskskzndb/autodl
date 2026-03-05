@@ -68,14 +68,14 @@ if __name__ == "__main__":
     
     # 2. 【核心修改】您想要平均哪些轮次？
     # 场景 A: 手动指定几个 (例如 21, 23, 25)
-    # EPOCHS_TO_AVG = [21, 23, 25]
+    EPOCHS_TO_AVG = [92, 90, 97, 93, 103]
     
     # 场景 B: 指定一个连续范围 (例如 23 到 38，包含 38)
     # range(start, end+1) -> range(23, 39) 代表 23,24,...,38
-    EPOCHS_TO_AVG = list(range(23, 39)) 
+    #EPOCHS_TO_AVG = list(range(23, 39)) 
     
     # 3. 输出文件的名字 (建议带上轮次范围，方便记忆)
-    OUTPUT_FILE = "./data/checkpoints/checkpoint_swa_23_38.pth"
+    OUTPUT_FILE = "./data/checkpoints/checkpoint_swa_3_3.pth"
     
     # =======================================================
     
