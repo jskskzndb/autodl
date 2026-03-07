@@ -923,15 +923,45 @@ if __name__ == '__main__':
     # =================================================================================
     # 🔥 [新增代码] 计算并打印模型参数量
     # =================================================================================
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    logging.info(f"""
-    📊 Model Summary:
-        Total Parameters:     {total_params / 1e6:.2f} M
-        Trainable Parameters: {trainable_params / 1e6:.2f} M
-        Frozen Parameters:    {(total_params - trainable_params) / 1e6:.2f} M
-    """)
+    try:
+        from thop import profile
+        import copy
+        
+        # 1. 制造替身：深拷贝一个临时模型，专门给 thop 糟蹋
+        temp_model = copy.deepcopy(model).to(device)
+        dummy_input = torch.randn(1, 3, 512, 512).to(device)
+        
+        # 2. 用替身计算 FLOPs
+        macs, _ = profile(temp_model, inputs=(dummy_input, ), verbose=False)
+        flops = macs * 2 
+        
+        # 3. 销毁替身，释放显存！保护主模型绝对干净！
+        del temp_model
+        torch.cuda.empty_cache()
+        
+        # 计算各类参数量
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen_params = total_params - trainable_params
+        
+        logging.info(f"""
+        📊 【模型计算复杂度 / Model Summary】:
+            Input Resolution:     1 x 3 x 512 x 512
+            FLOPs (G):            {flops / 1e9:.2f} G
+            Total Params (M):     {total_params / 1e6:.2f} M
+            ├─ Trainable (M):     {trainable_params / 1e6:.2f} M
+            └─ Frozen (M):        {frozen_params / 1e6:.2f} M
+        """)
+    except ImportError:
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logging.warning("未检测到 'thop' 库，无法计算 FLOPs。请运行 pip install thop")
+        logging.info(f"📊 Params (M): {total_params / 1e6:.2f} M (Trainable: {trainable_params / 1e6:.2f} M)")
+    except Exception as e:
+        # 万一遇到极端情况报错，直接跳过，绝不阻断训练
+        total_params = sum(p.numel() for p in model.parameters())
+        logging.warning(f"⚠️ 计算 FLOPs 时出错: {e}。跳过计算。")
+        logging.info(f"📊 Params (M): {total_params / 1e6:.2f} M")
     # =================================================================================
     # 加载权重
     checkpoint_to_load = None
